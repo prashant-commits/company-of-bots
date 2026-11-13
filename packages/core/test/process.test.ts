@@ -60,7 +60,7 @@ describe('process', () => {
       state: 'failed',
       resultNote: 'failed: confirm the application was not sent before retrying',
     });
-    const c2 = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true } });
+    const c2 = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt: s.park!.at } });
     expect(processQueue(agent)).toEqual([{ type: 'retry', applicationId: s.id, commandId: c2.id }]);
   });
 
@@ -242,14 +242,31 @@ describe('process', () => {
     });
   });
 
-  // B21 / H1 scenario B
+  // B21 (r07) dedupe applies to verified as well
+  test('B21 r07 dedupe applies to verified as well', () => {
+    const pV = seedPark('p-dup-verified', { type: 'captcha' });
+    const cv1 = createCommand(app, { verb: 'verified', target: pV.id, payload: {} }, new Date(T0));
+    const cv2 = createCommand(app, { verb: 'verified', target: pV.id, payload: {} }, new Date(T1));
+    const workV = processQueue(agent);
+    expect(workV).toEqual([{ type: 'retry', applicationId: pV.id, commandId: cv1.id }]);
+    expect(agent.get('command', cv2.id)).toMatchObject({
+      state: 'failed',
+      resultNote: 'failed: a retry for this application is already pending',
+    });
+  });
+
+  // B21 / H1 scenario B (r33, r34)
   test('B21 no Work returned if application dropped in the same batch', () => {
     const p = seedPark('p-retry-drop-batch', { type: 'captcha' });
-    createCommand(app, { verb: 'retry', target: p.id, payload: {} }, new Date(T0));
-    createCommand(app, { verb: 'drop', target: p.id, payload: { reason: 'changed my mind' } }, new Date(T1));
+    const c1 = createCommand(app, { verb: 'retry', target: p.id, payload: {} }, new Date(T0));
+    const c2 = createCommand(app, { verb: 'drop', target: p.id, payload: { reason: 'changed my mind' } }, new Date(T1));
     const work = processQueue(agent);
     expect(work).toEqual([]);
     expect(agent.get('application', p.id)!.state).toBe('dropped');
+    expect(agent.get('command', c1.id)).toMatchObject({
+      state: 'failed',
+      resultNote: 'failed: application is dropped',
+    });
   });
 
   // B22 (H2)
@@ -258,7 +275,7 @@ describe('process', () => {
     const s = seedInterruptedSubmit('p-h2');
     // Command created at T0 (e.g. 10:30)
     const T10_30 = '2026-11-11T10:30:00.000Z';
-    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true } }, new Date(T10_30));
+    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt: s.park!.at } }, new Date(T10_30));
     // Simulated second crash parks at T12 (newer than command)
     const T12 = '2026-11-11T12:00:00.000Z';
     const secondPark = recordOutcome(
@@ -296,6 +313,7 @@ describe('process', () => {
     expect(agent.get('application', good2.id)!.state).toBe('done');
     expect(agent.get('command', c2.id)!.state).toBe('failed');
     expect(agent.get('command', c2.id)!.resultNote).toMatch(/^failed:/);
+    expect(agent.get('command', c2.id)!.resultNote).toContain('invalid JSON in');
   });
 
   // B9 amended (M3)
@@ -328,7 +346,7 @@ describe('process', () => {
   // m31 [B11]
   test('B11 m31 retry with notSent false fails on may-have-been-sent row', () => {
     const s = seedInterruptedSubmit('p-m31');
-    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: false } });
+    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: false, parkAt: s.park!.at } });
     expect(processQueue(agent)).toEqual([]);
     expect(agent.get('command', c.id)).toMatchObject({
       state: 'failed',
@@ -411,5 +429,75 @@ describe('process', () => {
     // Replay same command
     processCommand(agent, cmd, new Date(T1));
     expect(agent.get('application', p.id)!.statusNotes).toHaveLength(1);
+  });
+
+  // N1: B22 replaced (no clock comparison anywhere)
+  test('N1 / B22: retry on may-have-been-sent requires exact parkAt match and notSent: true', () => {
+    const s = seedInterruptedSubmit('p-b22');
+    const parkAt = s.park!.at;
+
+    // Missing parkAt fails even with notSent: true
+    const cMissing = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true } });
+    expect(processQueue(agent)).toEqual([]);
+    expect(agent.get('command', cMissing.id)).toMatchObject({
+      state: 'failed',
+      resultNote: 'failed: confirm the application was not sent before retrying',
+    });
+
+    // Mismatched parkAt fails even with notSent: true
+    const cMismatch = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt: '2026-11-11T12:00:00.000Z' } });
+    expect(processQueue(agent)).toEqual([]);
+    expect(agent.get('command', cMismatch.id)).toMatchObject({
+      state: 'failed',
+      resultNote: 'failed: confirm the application was not sent before retrying',
+    });
+
+    // App clock 5 minutes behind (command createdAt < park.at): matching parkAt still authorises!
+    const cBehind = createCommand(
+      app,
+      { verb: 'retry', target: s.id, payload: { notSent: true, parkAt } },
+      new Date('2026-11-11T09:55:00.000Z'),
+    );
+    const work = processQueue(agent, new Date('2026-11-11T10:05:00.000Z'));
+    expect(work).toEqual([{ type: 'retry', applicationId: s.id, commandId: cBehind.id }]);
+  });
+
+  // N1 / r11: verified never authorises may-have-been-sent row
+  test('N1 / r11: verified never authorises may-have-been-sent row', () => {
+    const s = seedInterruptedSubmit('p-verified-after-submit');
+    const c = createCommand(app, { verb: 'verified', target: s.id, payload: {} }, new Date(T1));
+    expect(processQueue(agent)).toEqual([]);
+    expect(agent.get('command', c.id)).toMatchObject({
+      state: 'failed',
+      resultNote: 'failed: confirm the application was not sent before retrying',
+    });
+  });
+
+  // N2 / B27: valid confirmation rewrites park in place before returning retry Work
+  test('N2 / B27: valid confirmation rewrites park in place before returning retry Work', () => {
+    const s = seedInterruptedSubmit('p-b27');
+    const parkAt = s.park!.at;
+    const origNote = s.park!.note!;
+    const confirmTime = new Date('2026-11-11T11:00:00.000Z');
+
+    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt } }, confirmTime);
+    const work = processQueue(agent, confirmTime);
+    expect(work).toEqual([{ type: 'retry', applicationId: s.id, commandId: c.id }]);
+
+    const updatedApp = agent.get('application', s.id)!;
+    expect(updatedApp.park!.type).toBe('error');
+    expect(updatedApp.park!.at).toBe(parkAt);
+    expect(updatedApp.park!.afterSubmit).toBeUndefined();
+    expect(updatedApp.park!.note).toBe(`${origNote} — user confirmed not sent`);
+    expect(updatedApp.updatedAt).toBe(confirmTime.toISOString());
+
+    // After rewrite, beginSubmit can be called and succeeds (B20 amended guard is satisfied)
+    const sub = beginSubmit(
+      agent,
+      { applicationId: s.id },
+      { resumeFile: 'cv.pdf', points: [{ pointId: 'p-b27', rev: 1 }] },
+      new Date('2026-11-11T11:01:00.000Z'),
+    );
+    expect(sub.state).toBe('submitting');
   });
 });

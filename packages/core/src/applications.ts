@@ -122,6 +122,11 @@ export function beginSubmit(
         `application ${target.applicationId} is in state ${existing.state}, expected parked`,
       );
     }
+    if (existing.park?.type === 'error' && existing.park.afterSubmit) {
+      throw new ApplicationStateError(
+        `application ${target.applicationId} is in state ${existing.state} (may have been sent), cannot submit without confirmation`,
+      );
+    }
   } else {
     assertHttpUrl(target.link);
   }
@@ -260,6 +265,7 @@ export function recordOutcome(
     };
     base.pendingSubmission = null;
     base.park = null;
+    base.closedAt = null;
     base.updatedAt = atIso;
   } else if (outcome.type === 'park') {
     const parkInput = outcome.park as {
@@ -288,6 +294,7 @@ export function recordOutcome(
     };
     base.pendingSubmission = null;
     base.park = null;
+    base.closedAt = null;
     base.updatedAt = atIso;
   }
 

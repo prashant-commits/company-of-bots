@@ -14,7 +14,7 @@ type RunRole = 'finder' | 'applier' | 'guide';
 
 export type CommandInput =
   | { verb: 'interview_saved'; target: string | null; payload: { interviewId: string } }
-  | { verb: 'retry'; target: string; payload: { notSent?: boolean } }
+  | { verb: 'retry'; target: string; payload: { notSent?: boolean; parkAt?: string } }
   | { verb: 'done'; target: string; payload: Record<string, never> }
   | { verb: 'verified'; target: string; payload: Record<string, never> }
   | { verb: 'drop'; target: string; payload: { reason?: string } }

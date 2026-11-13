@@ -319,18 +319,50 @@ describe('applications', () => {
       }
       expect(appRecord.state).toBe(state);
       const before = agent.get('application', appRecord.id);
-      expect(() =>
+      let thrown: unknown;
+      try {
         beginSubmit(
           agent,
           { applicationId: appRecord.id },
           { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
           new Date(T1),
-        ),
-      ).toThrow(ApplicationStateError);
+        );
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ApplicationStateError);
+      expect((thrown as Error).message).toContain(appRecord.id);
+      expect((thrown as Error).message).toContain(state);
       const after = agent.get('application', appRecord.id);
       expect(after).toEqual(before);
     },
   );
+
+  // B20 amended (N2)
+  test('B20 amended: beginSubmit with { applicationId } on error park with afterSubmit: true throws ApplicationStateError and writes nothing', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const s = seedInterruptedSubmit('p1');
+    expect(s.park?.type).toBe('error');
+    expect(s.park?.afterSubmit).toBe(true);
+
+    const before = agent.get('application', s.id)!;
+    let thrown: unknown;
+    try {
+      beginSubmit(
+        agent,
+        { applicationId: s.id },
+        { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+        new Date(T1),
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ApplicationStateError);
+    expect((thrown as Error).message).toContain(s.id);
+    expect((thrown as Error).message).toContain(s.state);
+    const after = agent.get('application', s.id);
+    expect(after).toEqual(before);
+  });
 
   // B23 (M1)
   test.each(['submitted', 'done', 'dropped', 'skipped'] as const)(
@@ -392,21 +424,42 @@ describe('applications', () => {
     );
     expect(result.state).toBe('submitted');
     expect(result.submission).toMatchObject({ resumeFile: 'cv.pdf', submittedAt: T1 });
+    expect(result.closedAt).toBeNull();
     expect(agent.get('application', p.id)!.state).toBe('submitted');
+    expect(agent.get('application', p.id)!.closedAt).toBeNull();
+
+    const pDrop = seedPark('p-drop-sub', { type: 'captcha' });
+    createCommand(app, { verb: 'drop', target: pDrop.id, payload: { reason: 'not interested' } }, new Date(T0));
+    processQueue(agent, new Date(T0));
+    expect(agent.get('application', pDrop.id)!.state).toBe('dropped');
+    expect(agent.get('application', pDrop.id)!.closedAt).not.toBeNull();
+
+    const resDrop = recordOutcome(
+      agent,
+      { applicationId: pDrop.id },
+      { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+      new Date(T1),
+    );
+    expect(resDrop.state).toBe('submitted');
+    expect(resDrop.closedAt).toBeNull();
+    expect(agent.get('application', pDrop.id)!.closedAt).toBeNull();
   });
 
-  // B24 (L3)
-  test('B24 recordOutcome with afterSubmit true on non-error park throws Error and writes nothing', () => {
-    expect(() =>
-      recordOutcome(
-        agent,
-        appInput(),
-        { type: 'park', park: { type: 'captcha', afterSubmit: true, note: 'captcha after submit' } },
-        new Date(T0),
-      ),
-    ).toThrow();
-    expect(agent.list('application').items).toEqual([]);
-  });
+  // B24 (L3, r26)
+  test.each(['human', 'sign_in', 'code', 'missing_answer', 'verify', 'captcha'] as const)(
+    'B24 recordOutcome with afterSubmit true on %s park throws Error and writes nothing',
+    (parkType) => {
+      expect(() =>
+        recordOutcome(
+          agent,
+          appInput(),
+          { type: 'park', park: { type: parkType, afterSubmit: true, note: `${parkType} after submit` } },
+          new Date(T0),
+        ),
+      ).toThrow();
+      expect(agent.list('application').items).toEqual([]);
+    },
+  );
 
   // B25 (L4)
   test('B25 recordOutcome with unknown outcome type throws Error and writes nothing', () => {

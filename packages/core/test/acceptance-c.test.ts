@@ -111,7 +111,7 @@ test('C5 Retry on a may-have-been-sent row needs notSent: true', () => {
   const c1 = createCommand(app, { verb: 'retry', target: id, payload: {} });
   expect(processQueue(agent)).toEqual([]);
   expect(agent.get('command', c1.id)).toMatchObject({ state: 'failed', resultNote: 'failed: confirm the application was not sent before retrying' });
-  const c2 = createCommand(app, { verb: 'retry', target: id, payload: { notSent: true } });
+  const c2 = createCommand(app, { verb: 'retry', target: id, payload: { notSent: true, parkAt: T1 } });
   expect(processQueue(agent)).toEqual([{ type: 'retry', applicationId: id, commandId: c2.id }]);
 });
 

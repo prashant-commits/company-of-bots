@@ -187,7 +187,7 @@ const CommandBase = z.looseObject({
 
 const CommandVerbSchema = z.discriminatedUnion('verb', [
   z.looseObject({ verb: z.literal('interview_saved'), payload: z.looseObject({ interviewId: z.string() }) }),
-  z.looseObject({ verb: z.literal('retry'), payload: z.looseObject({ notSent: z.boolean().optional() }) }),
+  z.looseObject({ verb: z.literal('retry'), payload: z.looseObject({ notSent: z.boolean().optional(), parkAt: z.string().optional() }) }),
   z.looseObject({ verb: z.literal('done'), payload: z.looseObject({}) }),
   z.looseObject({ verb: z.literal('verified'), payload: z.looseObject({}) }),
   z.looseObject({ verb: z.literal('drop'), payload: z.looseObject({ reason: z.string().optional() }) }),

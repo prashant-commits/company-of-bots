@@ -1,6 +1,6 @@
 import type { DataRepo } from './repo.ts';
 import { finishCommand, queuedCommands, CommandError } from './commands.ts';
-import type { Command, StatusNote } from './schema.ts';
+import type { Command, StatusNote, Park } from './schema.ts';
 import { recoverInterrupted } from './applications.ts';
 
 export const HANDLED_VERBS = [
@@ -132,26 +132,54 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
             outcome = { state: 'done', note: 'closed: finished by user' };
           }
         } else if (cmd.verb === 'retry' || cmd.verb === 'verified') {
-          // Row B22 (H2)
+          // Row B22 (N1)
           if (app.state !== 'parked') {
             outcome = { state: 'failed', note: `failed: application is ${app.state}` };
           } else if (app.park?.type === 'error' && app.park.afterSubmit) {
-            const notSent = 'notSent' in cmd.payload && cmd.payload.notSent === true;
-            const parkNotNewer = app.park.at <= cmd.createdAt;
-            if (!notSent || !parkNotNewer) {
+            if (cmd.verb === 'verified') {
               outcome = {
                 state: 'failed',
                 note: 'failed: confirm the application was not sent before retrying',
               };
             } else {
-              outcome = {
-                state: 'needs_run',
-                work: {
-                  type: 'retry',
-                  applicationId: app.id,
-                  commandId: cmd.id,
-                },
-              };
+              const notSent = 'notSent' in cmd.payload && cmd.payload.notSent === true;
+              const matchingParkAt =
+                'parkAt' in cmd.payload &&
+                typeof cmd.payload.parkAt === 'string' &&
+                cmd.payload.parkAt === app.park.at;
+              if (!notSent || !matchingParkAt) {
+                outcome = {
+                  state: 'failed',
+                  note: 'failed: confirm the application was not sent before retrying',
+                };
+              } else {
+                // Row B27 (N2)
+                const { afterSubmit: _afterSubmit, ...restPark } = app.park;
+                const baseNote = app.park.note ?? '';
+                const newNote = baseNote
+                  ? `${baseNote} — user confirmed not sent`
+                  : 'user confirmed not sent';
+                const updatedPark: Park = {
+                  ...restPark,
+                  type: 'error',
+                  at: app.park.at,
+                  note: newNote,
+                };
+                const updatedApp = {
+                  ...app,
+                  park: updatedPark,
+                  updatedAt: atIso,
+                };
+                repo.put('application', updatedApp);
+                outcome = {
+                  state: 'needs_run',
+                  work: {
+                    type: 'retry',
+                    applicationId: app.id,
+                    commandId: cmd.id,
+                  },
+                };
+              }
             }
           } else {
             outcome = {
