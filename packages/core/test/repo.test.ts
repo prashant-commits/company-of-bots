@@ -117,3 +117,88 @@ test('B12 two repos on one dir write only their own kinds', () => {
   expect(agent.get('application', 'only-agent')).not.toBeNull();
   expect(agent.get('point', 'only-app')).toEqual(app.get('point', 'only-app'));
 });
+
+test('B4b deleteBlob refuses non-resume paths and .git', () => {
+  const app = tmpRepo('app');
+  app.writeBlob('profile/resumes/cv.pdf', new Uint8Array([1, 2]));
+  expect(() => app.deleteBlob('profile/points/x.json')).toThrow(OwnershipError);
+  expect(() => app.deleteBlob('.git/config')).toThrow(UnsafeNameError);
+  expect(() => app.deleteBlob('profile/resumes/cv.pdf')).not.toThrow();
+  expect(app.readBlob('profile/resumes/cv.pdf')).toBeNull();
+});
+
+test('B6 deleteBlob and listBlobs refuse escaping paths', () => {
+  const app = tmpRepo('app');
+  expect(() => app.deleteBlob('../x.pdf')).toThrow(UnsafeNameError);
+  expect(() => app.listBlobs('..')).toThrow(UnsafeNameError);
+});
+
+test('B6 backslash paths throw UnsafeNameError on blob methods', () => {
+  const app = tmpRepo('app');
+  expect(() => app.writeBlob('profile\\resumes\\cv.pdf', new Uint8Array([1]))).toThrow(UnsafeNameError);
+  expect(fs.existsSync(path.join(app.dir, 'profile\\resumes\\cv.pdf'))).toBe(false);
+});
+
+test('B6 symlink is refused by get, delete, getSingleton and putSingleton', () => {
+  const dir = tmpDir();
+  const app = tmpRepo('app', dir);
+  app.put('point', sample.point({ id: 'real' }));
+  const link = path.join(dir, 'profile/points/link.json');
+  fs.symlinkSync('/nonexistent-target', link);
+  expect(() => app.get('point', 'link')).toThrow(UnsafeNameError);
+  expect(() => app.delete('point', 'link')).toThrow(UnsafeNameError);
+
+  const lanesFile = path.join(dir, 'guide/lanes.json');
+  fs.mkdirSync(path.dirname(lanesFile), { recursive: true });
+  fs.writeFileSync(lanesFile, JSON.stringify({ lanes: [] }));
+  fs.unlinkSync(lanesFile);
+  fs.symlinkSync('/missing-lanes', lanesFile);
+  expect(() => app.getSingleton('lanes')).toThrow(UnsafeNameError);
+  expect(() => app.putSingleton('lanes', { lanes: [{ id: 'l', name: 'L' }] })).toThrow(UnsafeNameError);
+
+  const { errors } = app.list('point');
+  expect(errors.some((e) => path.basename(e.file) === 'link.json')).toBe(true);
+});
+
+test('B6b operations work when the repo dir does not exist yet', () => {
+  const dir = path.join(tmpDir(), 'fresh-repo');
+  const app = new DataRepo(dir, 'app');
+  expect(() => app.put('point', sample.point({ id: 'fresh' }))).not.toThrow();
+  expect(app.get('point', 'fresh')).not.toBeNull();
+  expect(() => app.putSingleton('master', { file: 'cv.pdf' })).not.toThrow();
+  expect(() => app.writeBlob('profile/resumes/cv.pdf', new Uint8Array([9]))).not.toThrow();
+  const before = new DataRepo(path.join(tmpDir(), 'read-only-new'), 'app');
+  expect(before.readBlob('profile/resumes/nope.pdf')).toBeNull();
+  expect(before.listBlobs('profile/resumes')).toEqual([]);
+});
+
+test('B7 list and listBlobs keep names that only contain .tmp- in the middle', () => {
+  const app = tmpRepo('app');
+  app.writeBlob('profile/resumes/resume.tmp-final.pdf', new Uint8Array([1]));
+  expect(app.listBlobs('profile/resumes')).toContain('resume.tmp-final.pdf');
+  app.put('point', sample.point({ id: 'draft.tmp-1' }));
+  expect(app.list('point').items.map((p) => p.id)).toContain('draft.tmp-1');
+});
+
+test('B7 put replaces a read-only file via rename', () => {
+  const app = tmpRepo('app');
+  app.put('point', sample.point({ id: 'ro', text: 'before' }));
+  const file = path.join(app.dir, 'profile/points/ro.json');
+  fs.chmodSync(file, 0o444);
+  expect(() => app.put('point', sample.point({ id: 'ro', text: 'after' }))).not.toThrow();
+  expect(app.get('point', 'ro')?.text).toBe('after');
+  fs.chmodSync(file, 0o644);
+});
+
+test('B7 failed put leaves no temp artifacts', () => {
+  const app = tmpRepo('app');
+  const dir = path.join(app.dir, 'profile/points');
+  app.put('point', sample.point({ id: 'a' }));
+  fs.chmodSync(dir, 0o555);
+  try {
+    expect(() => app.put('point', sample.point({ id: 'b' }))).toThrow();
+    expect(fs.readdirSync(dir).every((n) => !/\.tmp-[0-9a-f]{6}$/.test(n))).toBe(true);
+  } finally {
+    fs.chmodSync(dir, 0o755);
+  }
+});

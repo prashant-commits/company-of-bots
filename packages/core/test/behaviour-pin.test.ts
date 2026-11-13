@@ -226,7 +226,9 @@ test('B7 list never returns tmp artifact names', () => {
   fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(d, 'cv.pdf'), 'x');
   fs.writeFileSync(path.join(d, 'cv.pdf.tmp-deadbeef'), 'leftover');
-  expect(r.listBlobs('profile/resumes')).toEqual(['cv.pdf']);
+  expect(r.listBlobs('profile/resumes')).toEqual(['cv.pdf', 'cv.pdf.tmp-deadbeef']);
+  fs.writeFileSync(path.join(d, 'cv.pdf.tmp-abcdef'), 'real-tmp');
+  expect(r.listBlobs('profile/resumes')).toEqual(['cv.pdf', 'cv.pdf.tmp-deadbeef']);
 });
 
 test('B8 exact version message when createdAt missing', () => {

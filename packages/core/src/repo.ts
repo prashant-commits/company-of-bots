@@ -45,7 +45,13 @@ function hasGitSegment(relPath: string): boolean {
 }
 
 function isTmpArtifactName(name: string): boolean {
-  return /\.tmp-[0-9a-f]+$/.test(name) || name.includes('.tmp-');
+  return /\.tmp-[0-9a-f]{6}$/.test(name);
+}
+
+function assertNoBackslash(relPath: string): void {
+  if (relPath.includes('\\')) {
+    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+  }
 }
 
 type PathOptions = {
@@ -56,6 +62,7 @@ type PathOptions = {
 };
 
 function assertSafeRepoPath(repoDir: string, relPath: string, options: PathOptions = {}): string {
+  assertNoBackslash(relPath);
   const normalized = relPath.replace(/\\/g, '/');
   if (normalized === '' || normalized === '.' || normalized === './') {
     if (options.allowRepoRoot && normalized === '') {
@@ -93,6 +100,9 @@ function assertSafeRepoPath(repoDir: string, relPath: string, options: PathOptio
 
 function assertPathNoSymlinkEscape(repoDir: string, absPath: string): void {
   const root = path.resolve(repoDir);
+  if (!fs.existsSync(root)) {
+    return;
+  }
   const rootReal = fs.realpathSync.native(root);
 
   let current = root;
@@ -101,10 +111,14 @@ function assertPathNoSymlinkEscape(repoDir: string, absPath: string): void {
     for (const part of rel.split(path.sep)) {
       if (!part || part === '.') continue;
       current = path.join(current, part);
-      if (fs.existsSync(current)) {
+      try {
         if (fs.lstatSync(current).isSymbolicLink()) {
           throw new UnsafeNameError(`symbolic link in repo path: ${relFromRepo(repoDir, current)}`);
         }
+      } catch (e) {
+        if (e instanceof UnsafeNameError) throw e;
+        const err = e as NodeJS.ErrnoException;
+        if (err.code !== 'ENOENT') throw e;
       }
     }
   }
@@ -114,9 +128,28 @@ function assertPathNoSymlinkEscape(repoDir: string, absPath: string): void {
     if (anchor === root) break;
     anchor = path.dirname(anchor);
   }
-  const anchorReal = fs.realpathSync.native(anchor);
-  if (anchorReal !== rootReal && !anchorReal.startsWith(`${rootReal}${path.sep}`)) {
-    throw new UnsafeNameError(`path escapes repo via symlink`);
+  if (!fs.existsSync(anchor)) {
+    return;
+  }
+  try {
+    const anchorReal = fs.realpathSync.native(anchor);
+    if (anchorReal !== rootReal && !anchorReal.startsWith(`${rootReal}${path.sep}`)) {
+      throw new UnsafeNameError(`path escapes repo via symlink`);
+    }
+  } catch (e) {
+    if (e instanceof UnsafeNameError) throw e;
+    try {
+      if (fs.lstatSync(anchor).isSymbolicLink()) {
+        throw new UnsafeNameError(`symbolic link in repo path: ${relFromRepo(repoDir, anchor)}`);
+      }
+    } catch (inner) {
+      if (inner instanceof UnsafeNameError) throw inner;
+    }
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      throw new UnsafeNameError(`symbolic link in repo path: ${relFromRepo(repoDir, absPath)}`);
+    }
+    throw e;
   }
 }
 
@@ -124,6 +157,7 @@ const BLOB_RESUME = /^profile\/resumes\/([^/]+)$/;
 const BLOB_RESUME_TEXT = /^profile\/resume-text\/([^/]+)$/;
 
 function assertBlobWriteDeletePath(relPath: string, writer: Writer): string {
+  assertNoBackslash(relPath);
   const p = relPath.replace(/\\/g, '/');
   const match = BLOB_RESUME.exec(p) ?? BLOB_RESUME_TEXT.exec(p);
   const name = match?.[1];
@@ -134,6 +168,15 @@ function assertBlobWriteDeletePath(relPath: string, writer: Writer): string {
     throw new OwnershipError(`only the app may write resume blobs`);
   }
   return p;
+}
+
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
 }
 
 function recordStemMatches(kind: KindName, filePath: string, record: KindType<KindName>): boolean {
@@ -216,7 +259,8 @@ export class DataRepo {
   get<K extends KindName>(kind: K, id: string): KindType<K> | null {
     assertSafeId(id);
     const file = kindFilePath(this.dir, kind, id);
-    if (!fs.existsSync(file)) return null;
+    const lst = lstatOrNull(file);
+    if (lst === null) return null;
     assertSafeRepoPath(this.dir, path.relative(this.dir, file));
     let raw: string;
     try {
@@ -340,14 +384,17 @@ export class DataRepo {
       throw new OwnershipError(`${this.writer} may not delete ${kind}`);
     }
     const file = kindFilePath(this.dir, kind, id);
+    const lst = lstatOrNull(file);
+    if (lst === null) return;
     assertSafeRepoPath(this.dir, path.relative(this.dir, file));
-    if (fs.existsSync(file)) fs.unlinkSync(file);
+    fs.unlinkSync(file);
   }
 
   getSingleton<S extends SingletonName>(name: S): SingletonType<S> | null {
     const entry = SINGLETONS[name];
     const file = path.join(this.dir, entry.path);
-    if (!fs.existsSync(file)) return null;
+    const lst = lstatOrNull(file);
+    if (lst === null) return null;
     assertSafeRepoPath(this.dir, entry.path);
     let raw: string;
     try {
@@ -382,6 +429,7 @@ export class DataRepo {
   }
 
   writeBlob(relPath: string, bytes: Uint8Array): void {
+    assertNoBackslash(relPath);
     if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
       throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
     }
@@ -391,6 +439,8 @@ export class DataRepo {
   }
 
   readBlob(relPath: string): Buffer | null {
+    assertNoBackslash(relPath);
+    if (!fs.existsSync(path.resolve(this.dir))) return null;
     if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
       throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
     }
@@ -403,6 +453,8 @@ export class DataRepo {
   }
 
   listBlobs(relDir: string): string[] {
+    assertNoBackslash(relDir);
+    if (!fs.existsSync(path.resolve(this.dir))) return [];
     if (hasGitSegment(relDir.replace(/\\/g, '/'))) {
       throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relDir)}`);
     }
@@ -415,6 +467,7 @@ export class DataRepo {
   }
 
   deleteBlob(relPath: string): void {
+    assertNoBackslash(relPath);
     if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
       throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
     }
