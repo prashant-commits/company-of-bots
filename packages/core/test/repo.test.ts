@@ -46,7 +46,30 @@ test('commands: app creates only, agent updates only, nobody deletes', () => {
 test('ids and blob paths cannot escape the repo', () => {
   const r = tmpRepo('app');
   expect(() => r.put('point', sample.point({ id: '../x' }))).toThrow(UnsafeNameError);
-  expect(() => r.writeBlob('../outside.pdf', new Uint8Array([1]))).toThrow();
+  expect(() => r.writeBlob('../outside.pdf', new Uint8Array([1]))).toThrow(UnsafeNameError);
+});
+
+test('B5d UTF-8 BOM on cob.json and record files is ignored on read', () => {
+  const dir = tmpDir();
+  const meta = JSON.stringify({ schemaVersion: 1, createdAt: T0 });
+  fs.writeFileSync(path.join(dir, 'cob.json'), `\uFEFF${meta}`);
+  expect(() => new DataRepo(dir, 'app')).not.toThrow();
+
+  const r = new DataRepo(dir, 'app');
+  const p = sample.point({ id: 'bom-point' });
+  r.put('point', p);
+  const file = path.join(r.dir, 'profile/points/bom-point.json');
+  const body = fs.readFileSync(file, 'utf8');
+  fs.writeFileSync(file, `\uFEFF${body}`);
+  expect(r.get('point', 'bom-point')).toEqual(p);
+  expect(r.list('point').items).toContainEqual(p);
+});
+
+test('B5d files written by the repo do not start with a UTF-8 BOM', () => {
+  const r = tmpRepo('app');
+  r.put('point', sample.point({ id: 'no-bom' }));
+  const bytes = fs.readFileSync(path.join(r.dir, 'profile/points/no-bom.json'));
+  expect(bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
 });
 
 test('a repo with an unknown format version is refused', () => {

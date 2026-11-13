@@ -141,6 +141,12 @@ function recordStemMatches(kind: KindName, filePath: string, record: KindType<Ki
   return stem === recordFileId(kind, record);
 }
 
+/** Parse JSON text from disk, ignoring a leading UTF-8 BOM if present. */
+function parseJsonUtf8(raw: string): unknown {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  return JSON.parse(text);
+}
+
 function atomicWrite(absPath: string, data: string | Uint8Array): void {
   const dir = path.dirname(absPath);
   fs.mkdirSync(dir, { recursive: true });
@@ -172,7 +178,7 @@ function readCobJsonMeta(dir: string): void {
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonUtf8(raw);
   } catch {
     throw new UnsupportedSchemaError('This data repo could not be read.');
   }
@@ -220,7 +226,7 @@ export class DataRepo {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = parseJsonUtf8(raw);
     } catch (e) {
       throw new Error(`invalid JSON in ${file}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -269,7 +275,7 @@ export class DataRepo {
       }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(raw);
+        parsed = parseJsonUtf8(raw);
       } catch (e) {
         errors.push({ file, error: e instanceof Error ? e.message : String(e) });
         continue;
@@ -351,7 +357,7 @@ export class DataRepo {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = parseJsonUtf8(raw);
     } catch {
       throw new Error(`invalid JSON in ${file}`);
     }
