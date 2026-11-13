@@ -14,10 +14,15 @@ import type {
   Lanes,
   Master,
   OpenRole,
+  Park,
+  ParkType,
   Point,
   Source,
   Transcript,
 } from '../src/schema.ts';
+import { CONFIRMED } from '../src/confidence.ts';
+import { beginSubmit, type ApplicationInput } from '../src/applications.ts';
+import { processQueue } from '../src/process.ts';
 import type { KindName } from '../src/layout.ts';
 import type { Writer } from '../src/layout.ts';
 
@@ -35,6 +40,26 @@ export function tmpRepo(writer: Writer, dir?: string): DataRepo {
 
 export function said(quote: string): Evidence {
   return { type: 'said', quote };
+}
+
+export function roleInput(o: Partial<Omit<OpenRole, 'id' | 'foundAt'>> = {}): Omit<OpenRole, 'id' | 'foundAt'> {
+  return {
+    title: 'Warehouse supervisor',
+    organization: 'Example Foods',
+    sourceId: 's1',
+    link: 'https://careers.example.com/jobs/1',
+    applyPath: 'form',
+    ...o,
+  };
+}
+
+export function appInput(o: Partial<ApplicationInput> = {}): ApplicationInput {
+  return {
+    organization: 'Example Foods',
+    title: 'Warehouse supervisor',
+    link: 'https://careers.example.com/jobs/1',
+    ...o,
+  };
 }
 
 export function seedLanes(app: DataRepo): void {
@@ -153,7 +178,64 @@ export const sample = {
   },
 };
 
-export function pair(): { dir: string; app: DataRepo; agent: DataRepo } {
+export function pair(): {
+  dir: string;
+  app: DataRepo;
+  agent: DataRepo;
+  seedPark: (id: string, park: Omit<Park, 'at'> | Park, extra?: Partial<Application>) => Application;
+  seedInterruptedSubmit: (pointId?: string) => Application;
+} {
   const dir = tmpDir();
-  return { dir, app: new DataRepo(dir, 'app'), agent: new DataRepo(dir, 'agent') };
+  const app = new DataRepo(dir, 'app');
+  const agent = new DataRepo(dir, 'agent');
+
+  const seedPark = (
+    id: string,
+    park: Omit<Park, 'at'> | Park,
+    extra: Partial<Application> = {},
+  ): Application => {
+    const parkObj = park as {
+      type: ParkType;
+      at?: string;
+      site?: string;
+      fields?: string[];
+      contact?: string;
+      note?: string;
+      afterSubmit?: boolean;
+    };
+    const at = typeof parkObj.at === 'string' ? parkObj.at : T0;
+    const fullPark: Park = { ...parkObj, at };
+    const appRecord: Application = sample.application({
+      id,
+      state: 'parked',
+      park: fullPark,
+      parkHistory: [{ type: fullPark.type, at }],
+      pendingSubmission: fullPark.afterSubmit
+        ? {
+            resumeFile: 'cv.pdf',
+            points: [{ pointId: 'p1', rev: 1, field: 'Notice period' }],
+            startedAt: T0,
+          }
+        : null,
+      createdAt: T0,
+      updatedAt: T0,
+      ...extra,
+    });
+    agent.put('application', appRecord);
+    return appRecord;
+  };
+
+  const seedInterruptedSubmit = (pointId: string = 'p1'): Application => {
+    app.put('point', sample.point({ id: pointId, rank: CONFIRMED, rev: 1 }));
+    const s = beginSubmit(
+      agent,
+      appInput(),
+      { resumeFile: 'cv.pdf', points: [{ pointId, rev: 1, field: 'Notice period' }] },
+      new Date(T0),
+    );
+    processQueue(agent, new Date(T1));
+    return agent.get('application', s.id)!;
+  };
+
+  return { dir, app, agent, seedPark, seedInterruptedSubmit };
 }
