@@ -75,5 +75,7 @@ test('ownerOfPath maps every layout path to its owner', () => {
   expect(ownerOfPath('applications/a1.json')).toBe('agent');
   expect(ownerOfPath('commands/c1.json')).toBe('agent');
   expect(ownerOfPath('guide/log/2026-11-11.json')).toBe('agent');
+  expect(ownerOfPath('commands/README.md')).toBe('agent');
+  expect(ownerOfPath('sources/README.md')).toBe('app');
   expect(ownerOfPath('notes.txt')).toBeNull();
 });

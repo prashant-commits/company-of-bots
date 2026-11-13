@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { assertSafeId, UnsafeNameError } from './ids.ts';
 import { KINDS, SINGLETONS, type KindName, type KindType, type SingletonName, type SingletonType, type Writer } from './layout.ts';
 import { RepoMetaSchema, SCHEMA_VERSION } from './schema.ts';
-import type { Application, Command, DayLog, Transcript } from './schema.ts';
+import type { DayLog, Transcript } from './schema.ts';
 
 export type RepoReadError = { file: string; error: string };
 
@@ -33,13 +33,174 @@ function kindFilePath(dir: string, kind: KindName, id: string): string {
   return path.join(dir, entry.dir, `${id}.json`);
 }
 
-function assertInsideRepo(repoDir: string, relPath: string): string {
+function relFromRepo(repoDir: string, abs: string): string {
+  return path.relative(repoDir, abs).split(path.sep).join('/');
+}
+
+function hasGitSegment(relPath: string): boolean {
+  return relPath
+    .replace(/\\/g, '/')
+    .split('/')
+    .some((part) => part.toLowerCase() === '.git');
+}
+
+function isTmpArtifactName(name: string): boolean {
+  return /\.tmp-[0-9a-f]+$/.test(name) || name.includes('.tmp-');
+}
+
+type PathOptions = {
+  /** Allow resolving to an existing directory (for list/listBlobs). */
+  allowExistingDirectory?: boolean;
+  /** Allow resolving exactly to the repo root (for listBlobs on ''). */
+  allowRepoRoot?: boolean;
+};
+
+function assertSafeRepoPath(repoDir: string, relPath: string, options: PathOptions = {}): string {
+  const normalized = relPath.replace(/\\/g, '/');
+  if (normalized === '' || normalized === '.' || normalized === './') {
+    if (options.allowRepoRoot && normalized === '') {
+      const root = path.resolve(repoDir);
+      assertPathNoSymlinkEscape(repoDir, root);
+      return root;
+    }
+    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+  }
+
+  if (hasGitSegment(normalized)) {
+    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+  }
+
   const abs = path.resolve(repoDir, relPath);
   const root = path.resolve(repoDir);
   if (abs !== root && !abs.startsWith(`${root}${path.sep}`)) {
     throw new UnsafeNameError(`path escapes repo: ${JSON.stringify(relPath)}`);
   }
+
+  if (abs === root && !options.allowRepoRoot) {
+    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+  }
+
+  if (fs.existsSync(abs)) {
+    const stat = fs.statSync(abs);
+    if (stat.isDirectory() && !options.allowExistingDirectory) {
+      throw new UnsafeNameError(`path is a directory: ${JSON.stringify(relPath)}`);
+    }
+  }
+
+  assertPathNoSymlinkEscape(repoDir, abs);
   return abs;
+}
+
+function assertPathNoSymlinkEscape(repoDir: string, absPath: string): void {
+  const root = path.resolve(repoDir);
+  const rootReal = fs.realpathSync.native(root);
+
+  let current = root;
+  const rel = path.relative(root, absPath);
+  if (rel !== '' && rel !== '.') {
+    for (const part of rel.split(path.sep)) {
+      if (!part || part === '.') continue;
+      current = path.join(current, part);
+      if (fs.existsSync(current)) {
+        if (fs.lstatSync(current).isSymbolicLink()) {
+          throw new UnsafeNameError(`symbolic link in repo path: ${relFromRepo(repoDir, current)}`);
+        }
+      }
+    }
+  }
+
+  let anchor = absPath;
+  while (!fs.existsSync(anchor)) {
+    if (anchor === root) break;
+    anchor = path.dirname(anchor);
+  }
+  const anchorReal = fs.realpathSync.native(anchor);
+  if (anchorReal !== rootReal && !anchorReal.startsWith(`${rootReal}${path.sep}`)) {
+    throw new UnsafeNameError(`path escapes repo via symlink`);
+  }
+}
+
+const BLOB_RESUME = /^profile\/resumes\/([^/]+)$/;
+const BLOB_RESUME_TEXT = /^profile\/resume-text\/([^/]+)$/;
+
+function assertBlobWriteDeletePath(relPath: string, writer: Writer): string {
+  const p = relPath.replace(/\\/g, '/');
+  const match = BLOB_RESUME.exec(p) ?? BLOB_RESUME_TEXT.exec(p);
+  const name = match?.[1];
+  if (!name || name === '.' || name === '..') {
+    throw new OwnershipError(`blob path not allowed: ${JSON.stringify(relPath)}`);
+  }
+  if (writer !== 'app') {
+    throw new OwnershipError(`only the app may write resume blobs`);
+  }
+  return p;
+}
+
+function recordStemMatches(kind: KindName, filePath: string, record: KindType<KindName>): boolean {
+  const stem = path.basename(filePath, '.json');
+  return stem === recordFileId(kind, record);
+}
+
+/** Parse JSON text from disk, ignoring a leading UTF-8 BOM if present. */
+function parseJsonUtf8(raw: string): unknown {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  return JSON.parse(text);
+}
+
+function atomicWrite(absPath: string, data: string | Uint8Array): void {
+  const dir = path.dirname(absPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `${path.basename(absPath)}.tmp-${randomBytes(3).toString('hex')}`);
+  try {
+    if (typeof data === 'string') fs.writeFileSync(tmp, data, 'utf8');
+    else fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, absPath);
+  } catch (e) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup failure */
+    }
+    throw e;
+  }
+}
+
+function readCobJsonMeta(dir: string): void {
+  const metaPath = path.join(dir, 'cob.json');
+  if (!fs.existsSync(metaPath)) return;
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(metaPath, 'utf8');
+  } catch {
+    throw new UnsupportedSchemaError('This data repo could not be read.');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseJsonUtf8(raw);
+  } catch {
+    throw new UnsupportedSchemaError('This data repo could not be read.');
+  }
+
+  if (typeof parsed === 'object' && parsed !== null && 'schemaVersion' in parsed) {
+    const version = (parsed as { schemaVersion: unknown }).schemaVersion;
+    if (typeof version === 'number' && version !== SCHEMA_VERSION) {
+      throw new UnsupportedSchemaError(
+        `This data repo uses format version ${version}; this app supports version 1. Update the app.`,
+      );
+    }
+  }
+
+  const meta = RepoMetaSchema.safeParse(parsed);
+  if (!meta.success) {
+    throw new UnsupportedSchemaError('This data repo could not be read.');
+  }
+  if (meta.data.schemaVersion !== SCHEMA_VERSION) {
+    throw new UnsupportedSchemaError(
+      `This data repo uses format version ${meta.data.schemaVersion}; this app supports version 1. Update the app.`,
+    );
+  }
 }
 
 export class DataRepo {
@@ -49,36 +210,14 @@ export class DataRepo {
   constructor(dir: string, writer: Writer) {
     this.dir = dir;
     this.writer = writer;
-    const metaPath = path.join(dir, 'cob.json');
-    if (fs.existsSync(metaPath)) {
-      let raw: string;
-      try {
-        raw = fs.readFileSync(metaPath, 'utf8');
-      } catch {
-        throw new UnsupportedSchemaError('This data repo could not be read.');
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        throw new UnsupportedSchemaError('This data repo could not be read.');
-      }
-      const meta = RepoMetaSchema.safeParse(parsed);
-      if (!meta.success) {
-        throw new UnsupportedSchemaError('This data repo could not be read.');
-      }
-      if (meta.data.schemaVersion !== SCHEMA_VERSION) {
-        throw new UnsupportedSchemaError(
-          `This data repo uses format version ${meta.data.schemaVersion}; this app supports version 1. Update the app.`,
-        );
-      }
-    }
+    readCobJsonMeta(dir);
   }
 
   get<K extends KindName>(kind: K, id: string): KindType<K> | null {
     assertSafeId(id);
     const file = kindFilePath(this.dir, kind, id);
     if (!fs.existsSync(file)) return null;
+    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -87,13 +226,16 @@ export class DataRepo {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = parseJsonUtf8(raw);
     } catch (e) {
       throw new Error(`invalid JSON in ${file}: ${e instanceof Error ? e.message : String(e)}`);
     }
     const result = KINDS[kind].schema.safeParse(parsed);
     if (!result.success) {
       throw new Error(`schema validation failed for ${file}`);
+    }
+    if (!recordStemMatches(kind, file, result.data as KindType<KindName>)) {
+      throw new Error(`record id does not match file name for ${file}`);
     }
     return result.data as KindType<K>;
   }
@@ -104,9 +246,26 @@ export class DataRepo {
     const items: KindType<K>[] = [];
     const errors: RepoReadError[] = [];
     if (!fs.existsSync(kindDir)) return { items, errors };
+
+    try {
+      assertSafeRepoPath(this.dir, entry.dir, { allowExistingDirectory: true });
+    } catch (e) {
+      errors.push({
+        file: kindDir,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return { items, errors };
+    }
+
     for (const name of fs.readdirSync(kindDir)) {
-      if (!name.endsWith('.json')) continue;
+      if (!name.endsWith('.json') || isTmpArtifactName(name)) continue;
       const file = path.join(kindDir, name);
+      try {
+        assertSafeRepoPath(this.dir, path.relative(this.dir, file));
+      } catch (e) {
+        errors.push({ file, error: e instanceof Error ? e.message : String(e) });
+        continue;
+      }
       let raw: string;
       try {
         raw = fs.readFileSync(file, 'utf8');
@@ -116,7 +275,7 @@ export class DataRepo {
       }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(raw);
+        parsed = parseJsonUtf8(raw);
       } catch (e) {
         errors.push({ file, error: e instanceof Error ? e.message : String(e) });
         continue;
@@ -124,6 +283,10 @@ export class DataRepo {
       const result = entry.schema.safeParse(parsed);
       if (!result.success) {
         errors.push({ file, error: result.error.message });
+        continue;
+      }
+      if (!recordStemMatches(kind, file, result.data as KindType<KindName>)) {
+        errors.push({ file, error: `record id does not match file name` });
         continue;
       }
       items.push(result.data as KindType<K>);
@@ -164,12 +327,9 @@ export class DataRepo {
     this.assertCanWrite(kind, id);
 
     const file = kindFilePath(this.dir, kind, id);
-    const dir = path.dirname(file);
-    fs.mkdirSync(dir, { recursive: true });
+    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
     const body = `${JSON.stringify(parsed.data, null, 2)}\n`;
-    const tmp = path.join(dir, `${path.basename(file)}.tmp-${randomBytes(3).toString('hex')}`);
-    fs.writeFileSync(tmp, body, 'utf8');
-    fs.renameSync(tmp, file);
+    atomicWrite(file, body);
   }
 
   delete<K extends KindName>(kind: K, id: string): void {
@@ -180,6 +340,7 @@ export class DataRepo {
       throw new OwnershipError(`${this.writer} may not delete ${kind}`);
     }
     const file = kindFilePath(this.dir, kind, id);
+    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
     if (fs.existsSync(file)) fs.unlinkSync(file);
   }
 
@@ -187,6 +348,7 @@ export class DataRepo {
     const entry = SINGLETONS[name];
     const file = path.join(this.dir, entry.path);
     if (!fs.existsSync(file)) return null;
+    assertSafeRepoPath(this.dir, entry.path);
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -195,8 +357,8 @@ export class DataRepo {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
+      parsed = parseJsonUtf8(raw);
+    } catch {
       throw new Error(`invalid JSON in ${file}`);
     }
     const result = entry.schema.safeParse(parsed);
@@ -214,37 +376,50 @@ export class DataRepo {
     const parsed = entry.schema.safeParse(value);
     if (!parsed.success) throw parsed.error;
     const file = path.join(this.dir, entry.path);
-    const dir = path.dirname(file);
-    fs.mkdirSync(dir, { recursive: true });
+    assertSafeRepoPath(this.dir, entry.path);
     const body = `${JSON.stringify(parsed.data, null, 2)}\n`;
-    const tmp = path.join(dir, `${path.basename(file)}.tmp-${randomBytes(3).toString('hex')}`);
-    fs.writeFileSync(tmp, body, 'utf8');
-    fs.renameSync(tmp, file);
+    atomicWrite(file, body);
   }
 
   writeBlob(relPath: string, bytes: Uint8Array): void {
-    const abs = assertInsideRepo(this.dir, relPath);
-    const dir = path.dirname(abs);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${abs}.tmp-${randomBytes(3).toString('hex')}`;
-    fs.writeFileSync(tmp, bytes);
-    fs.renameSync(tmp, abs);
+    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
+      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+    }
+    const abs = assertSafeRepoPath(this.dir, relPath);
+    assertBlobWriteDeletePath(relPath, this.writer);
+    atomicWrite(abs, bytes);
   }
 
   readBlob(relPath: string): Buffer | null {
-    const abs = assertInsideRepo(this.dir, relPath);
-    if (!fs.existsSync(abs)) return null;
+    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
+      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+    }
+    const abs = assertSafeRepoPath(this.dir, relPath, {
+      allowExistingDirectory: true,
+      allowRepoRoot: relPath.replace(/\\/g, '/') === '',
+    });
+    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) return null;
     return fs.readFileSync(abs);
   }
 
   listBlobs(relDir: string): string[] {
-    const abs = assertInsideRepo(this.dir, relDir);
+    if (hasGitSegment(relDir.replace(/\\/g, '/'))) {
+      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relDir)}`);
+    }
+    const abs = assertSafeRepoPath(this.dir, relDir, {
+      allowExistingDirectory: true,
+      allowRepoRoot: relDir.replace(/\\/g, '/') === '',
+    });
     if (!fs.existsSync(abs)) return [];
-    return fs.readdirSync(abs);
+    return fs.readdirSync(abs).filter((n) => !isTmpArtifactName(n));
   }
 
   deleteBlob(relPath: string): void {
-    const abs = assertInsideRepo(this.dir, relPath);
+    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
+      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
+    }
+    const abs = assertSafeRepoPath(this.dir, relPath);
+    assertBlobWriteDeletePath(relPath, this.writer);
     if (fs.existsSync(abs)) fs.unlinkSync(abs);
   }
 }
