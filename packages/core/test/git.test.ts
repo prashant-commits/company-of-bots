@@ -598,3 +598,31 @@ test('git() returns raw stdout and throws GitError with the exit code and stderr
   expect(err.exitCode).toBe(128);
   expect(err.stderr).toContain('fatal');
 }, T);
+
+test('B19 a DataRepo temp file present during a sync is never committed or pushed, and stays on disk', async () => {
+  const tmpFile = 'profile/points/p1.json.tmp-a1b2c3';
+  write(appDir, tmpFile, '{"half":');
+  write(appDir, 'profile/resumes/cv.pdf.tmp-0f9e8d', 'partial');
+  write(appDir, 'notes.tmp-zzzzzz', 'not a DataRepo temp name\n'); // non-hex suffix: an ordinary file
+  write(appDir, 'real.txt', 'real\n');
+  const r = await syncRepo(appDir, 'app', 'mid-write');
+  expect(r.pushed).toBe(true);
+  const tree = sh(remote, 'ls-tree', '-r', '--name-only', 'main');
+  expect(tree).toContain('real.txt');
+  expect(tree).toContain('notes.tmp-zzzzzz');
+  expect(tree).not.toContain('.tmp-a1b2c3');
+  expect(tree).not.toContain('.tmp-0f9e8d');
+  expect(sh(remote, 'log', '--all', '--name-only', '--format=')).not.toMatch(/\.tmp-[0-9a-f]{6}/);
+  expect(read(appDir, tmpFile)).toBe('{"half":');
+  expect(sh(appDir, 'diff', '--cached', '--name-only')).toBe('');
+  expect(rebaseInProgress(appDir)).toBe(false);
+}, T);
+
+test('B19 a temp file alone is not a change, and pullRepo leaves it untouched too', async () => {
+  const tmpFile = 'sources/s1.json.tmp-a1b2c3';
+  write(agentDir, tmpFile, '{"half":');
+  expect(await syncRepo(agentDir, 'agent', 'mid-write')).toMatchObject({ committed: null, pushed: true });
+  expect(await pullRepo(agentDir, 'agent')).toMatchObject({ committed: null });
+  expect(sh(remote, 'log', '--all', '--name-only', '--format=')).not.toContain('.tmp-');
+  expect(read(agentDir, tmpFile)).toBe('{"half":');
+}, T);

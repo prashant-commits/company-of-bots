@@ -276,6 +276,9 @@ async function guarded<T>(dir: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/** The temp name `DataRepo` writes before renaming: `<file>.tmp-<6 hex>`. */
+const TEMP_FILE = /\.tmp-[0-9a-f]{6}$/;
+
 type Made = { sha: string; stamp: string };
 
 async function stampOf(dir: string, rev: string): Promise<string> {
@@ -285,7 +288,13 @@ async function stampOf(dir: string, rev: string): Promise<string> {
 /** Step 1: stage everything, refuse secrets, commit if anything is staged. */
 async function stageAndCommit(dir: string, message: string): Promise<Made | null> {
   await git(dir, ['add', '-A']);
-  const staged = splitZ(await git(dir, ['diff', '--cached', '--name-only', '-z', '--no-renames']));
+  let staged = splitZ(await git(dir, ['diff', '--cached', '--name-only', '-z', '--no-renames']));
+  // A DataRepo write may be in flight: never commit its temp file. This does not rely on .gitignore.
+  const inFlight = staged.filter((p) => TEMP_FILE.test(p));
+  if (inFlight.length > 0) {
+    await git(dir, ['reset', '-q', '--', ...inFlight]);
+    staged = staged.filter((p) => !TEMP_FILE.test(p));
+  }
   if (staged.length === 0) return null;
   try {
     assertNoSecrets(dir, staged);
