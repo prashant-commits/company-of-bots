@@ -13,7 +13,7 @@ export function newId(now: Date = new Date()): string {
   return `${stamp}-${randomBytes(3).toString('hex')}`;
 }
 
-const TRACKING = /^(utm_.*|gclid|fbclid|ref)$/;
+const TRACKING = /^(utm_.*|gclid|fbclid|ref)$/i;
 
 /** Stable role id from a posting link, ignoring tracking params, hash, trailing slash and host case. */
 export function roleIdFor(link: string): string {
@@ -27,12 +27,19 @@ export function roleIdFor(link: string): string {
   return `r-${createHash('sha256').update(canonical).digest('hex').slice(0, 16)}`;
 }
 
-/** Reduce an uploaded file name to a safe base name. */
+const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+/** Reduce an uploaded file name to one segment that is safe on Windows, macOS and Linux. */
 export function safeFileName(name: string): string {
   const last = name.split(/[/\\]/).pop() ?? '';
-  const cleaned = last.trim().replace(/^\.+/, '');
-  if (cleaned === '' || cleaned === '..') throw new UnsafeNameError(`unsafe file name: ${JSON.stringify(name)}`);
-  return cleaned;
+  const cleaned = last
+    .trim()
+    .replace(/[<>:"|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/, '')
+    .replace(/^\.+/, '');
+  if (cleaned === '') throw new UnsafeNameError(`unsafe file name: ${JSON.stringify(name)}`);
+  const stem = cleaned.split('.')[0] ?? '';
+  return RESERVED.test(stem.trim()) ? `_${cleaned}` : cleaned;
 }
 
 export function assertSafeId(id: string): void {
