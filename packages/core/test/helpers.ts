@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { expect } from 'vitest';
 import { DataRepo } from '../src/repo.ts';
 import { newId } from '../src/ids.ts';
 import type {
@@ -238,4 +240,21 @@ export function pair(): {
   };
 
   return { dir, app, agent, seedPark, seedInterruptedSubmit };
+}
+
+/** A bare git repo in a temp dir, for use as a remote. */
+export function bare(): string {
+  const dir = path.join(tmpDir(), 'remote.git');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', dir]);
+  return dir;
+}
+
+export function rebaseInProgress(dir: string): boolean {
+  return fs.existsSync(path.join(dir, '.git', 'rebase-merge')) || fs.existsSync(path.join(dir, '.git', 'rebase-apply'));
+}
+
+/** Assert the working tree has nothing uncommitted and no rebase is in progress. */
+export function clean(dir: string): void {
+  expect(rebaseInProgress(dir)).toBe(false);
+  expect(execFileSync('git', ['status', '--porcelain'], { cwd: dir }).toString()).toBe('');
 }

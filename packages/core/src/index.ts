@@ -8,3 +8,6 @@ export * from './commands.ts';
 export * from './applications.ts';
 export * from './process.ts';
 export * from './inbox.ts';
+export * from './copy.ts';
+export * from './init.ts';
+export * from './git.ts';
