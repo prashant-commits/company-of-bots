@@ -45,40 +45,63 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
     if (!cmd.target) {
       outcome = { state: 'failed', note: `failed: unknown application ${cmd.target}` };
     } else {
-      const app = repo.get('application', cmd.target);
+      let app;
+      try {
+        app = repo.get('application', cmd.target);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        outcome = { state: 'failed', note: `failed: ${msg}` };
+        const currentCmd = repo.get('command', cmd.id);
+        if (currentCmd?.state === 'queued') {
+          finishCommand(repo, cmd.id, outcome.state, outcome.note, now);
+        }
+        return outcome;
+      }
+
       if (!app) {
         outcome = { state: 'failed', note: `failed: unknown application ${cmd.target}` };
       } else {
         const atIso = now.toISOString();
 
         if (cmd.verb === 'status') {
-          const statusNote: StatusNote = {
-            at: atIso,
-            kind: cmd.payload.kind,
-            text: cmd.payload.text,
-            commandId: cmd.id,
-          };
-          const updated = {
-            ...app,
-            statusNotes: [...app.statusNotes, statusNote],
-            updatedAt: atIso,
-          };
-          repo.put('application', updated);
-          outcome = { state: 'done', note: `status: ${cmd.payload.kind}` };
+          // Row B10, amended (L1): idempotent by commandId
+          if (app.statusNotes.some((n) => n.commandId === cmd.id)) {
+            outcome = { state: 'done', note: `status: ${cmd.payload.kind}` };
+          } else {
+            const statusNote: StatusNote = {
+              at: atIso,
+              kind: cmd.payload.kind,
+              text: cmd.payload.text,
+              commandId: cmd.id,
+            };
+            const updated = {
+              ...app,
+              statusNotes: [...app.statusNotes, statusNote],
+              updatedAt: atIso,
+            };
+            repo.put('application', updated);
+            outcome = { state: 'done', note: `status: ${cmd.payload.kind}` };
+          }
         } else if (cmd.verb === 'drop') {
-          const updated = {
-            ...app,
-            state: 'dropped' as const,
-            park: null,
-            pendingSubmission: null,
-            closedAt: atIso,
-            updatedAt: atIso,
-          };
-          repo.put('application', updated);
-          const reason = cmd.payload?.reason;
-          const note = reason ? `closed: dropped — ${reason}` : 'closed: dropped';
-          outcome = { state: 'done', note };
+          // Row B9, amended (M3): done and drop apply only to parked applications
+          if (app.state !== 'parked') {
+            outcome = { state: 'failed', note: `failed: application is ${app.state}` };
+          } else {
+            const updated = {
+              ...app,
+              state: 'dropped' as const,
+              park: null,
+              pendingSubmission: null,
+              closedAt: atIso,
+              updatedAt: atIso,
+            };
+            repo.put('application', updated);
+            const reason = cmd.payload?.reason;
+            const note = reason ? `closed: dropped — ${reason}` : 'closed: dropped';
+            outcome = { state: 'done', note };
+          }
         } else if (cmd.verb === 'done') {
+          // Row B9, amended (M3) & Row B8, amended (m37)
           if (app.state !== 'parked') {
             outcome = { state: 'failed', note: `failed: application is ${app.state}` };
           } else if (app.park?.type === 'error' && app.park.afterSubmit && app.pendingSubmission) {
@@ -92,6 +115,7 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
               },
               pendingSubmission: null,
               park: null,
+              closedAt: null, // Clarification for m37
               updatedAt: atIso,
             };
             repo.put('application', updated);
@@ -108,17 +132,27 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
             outcome = { state: 'done', note: 'closed: finished by user' };
           }
         } else if (cmd.verb === 'retry' || cmd.verb === 'verified') {
+          // Row B22 (H2)
           if (app.state !== 'parked') {
             outcome = { state: 'failed', note: `failed: application is ${app.state}` };
-          } else if (
-            app.park?.type === 'error' &&
-            app.park.afterSubmit &&
-            !('notSent' in cmd.payload && cmd.payload.notSent === true)
-          ) {
-            outcome = {
-              state: 'failed',
-              note: 'failed: confirm the application was not sent before retrying',
-            };
+          } else if (app.park?.type === 'error' && app.park.afterSubmit) {
+            const notSent = 'notSent' in cmd.payload && cmd.payload.notSent === true;
+            const parkNotNewer = app.park.at <= cmd.createdAt;
+            if (!notSent || !parkNotNewer) {
+              outcome = {
+                state: 'failed',
+                note: 'failed: confirm the application was not sent before retrying',
+              };
+            } else {
+              outcome = {
+                state: 'needs_run',
+                work: {
+                  type: 'retry',
+                  applicationId: app.id,
+                  commandId: cmd.id,
+                },
+              };
+            }
           } else {
             outcome = {
               state: 'needs_run',
@@ -137,7 +171,10 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
   }
 
   if (outcome.state === 'done' || outcome.state === 'failed') {
-    finishCommand(repo, cmd.id, outcome.state, outcome.note, now);
+    const currentCmd = repo.get('command', cmd.id);
+    if (currentCmd?.state === 'queued') {
+      finishCommand(repo, cmd.id, outcome.state, outcome.note, now);
+    }
   }
 
   return outcome;
@@ -147,14 +184,62 @@ export function processQueue(repo: DataRepo, now: Date = new Date()): Work[] {
   recoverInterrupted(repo, now);
   const queued = queuedCommands(repo);
   const work: Work[] = [];
+  const seenRetryApps = new Set<string>();
+
   for (const cmd of queued) {
     if (!HANDLED_VERBS.includes(cmd.verb as HandledVerb)) {
       continue;
     }
-    const outcome = processCommand(repo, cmd, now);
-    if (outcome.state === 'needs_run') {
-      work.push(outcome.work);
+
+    // Row B21: at most one Work per application per pass
+    if (
+      (cmd.verb === 'retry' || cmd.verb === 'verified') &&
+      cmd.target &&
+      seenRetryApps.has(cmd.target)
+    ) {
+      finishCommand(
+        repo,
+        cmd.id,
+        'failed',
+        'failed: a retry for this application is already pending',
+        now,
+      );
+      continue;
+    }
+
+    // Rows B14 and B15 amended (M2): error processing command fails command and continues
+    try {
+      const outcome = processCommand(repo, cmd, now);
+      if (outcome.state === 'needs_run') {
+        work.push(outcome.work);
+        if (outcome.work.type === 'retry') {
+          seenRetryApps.add(outcome.work.applicationId);
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      finishCommand(repo, cmd.id, 'failed', `failed: ${msg}`, now);
     }
   }
-  return work;
+
+  // Ensure no Work is returned for an application dropped or closed in the same batch
+  const validWork: Work[] = [];
+  for (const w of work) {
+    if (w.type === 'retry') {
+      const targetApp = repo.get('application', w.applicationId);
+      if (!targetApp || targetApp.state !== 'parked') {
+        finishCommand(
+          repo,
+          w.commandId,
+          'failed',
+          `failed: application is ${targetApp?.state ?? 'unknown'}`,
+          now,
+        );
+        continue;
+      }
+    }
+    validWork.push(w);
+  }
+
+  return validWork;
 }

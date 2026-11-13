@@ -12,6 +12,13 @@ export class UnsendablePointError extends Error {
   }
 }
 
+export class ApplicationStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ApplicationStateError';
+  }
+}
+
 export type ApplicationInput = {
   roleId?: string;
   organization: string;
@@ -25,6 +32,22 @@ export type Outcome =
   | { type: 'submitted'; resumeFile: string; points: PointRef[] }
   | { type: 'skipped'; hardNoPointId: string };
 
+function assertHttpUrl(link: string): void {
+  let u: URL;
+  try {
+    u = new URL(link);
+  } catch {
+    throw new Error(`link is not a valid URL: ${link}`);
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error(`link must be http or https: ${link}`);
+  }
+}
+
+function isValidPointId(id: unknown): boolean {
+  return typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..';
+}
+
 export function sendablePoints(repo: DataRepo): Point[] {
   return repo.list('point').items.filter((p) => isSendable(p));
 }
@@ -32,6 +55,10 @@ export function sendablePoints(repo: DataRepo): Point[] {
 export function assertSendable(repo: DataRepo, refs: readonly PointRef[]): void {
   const badRefs: string[] = [];
   for (const ref of refs) {
+    if (!isValidPointId(ref.pointId) || typeof ref.rev !== 'number' || !Number.isInteger(ref.rev) || ref.rev < 1) {
+      badRefs.push(String(ref.pointId));
+      continue;
+    }
     const pt = repo.get('point', ref.pointId);
     if (!pt || !isSendable(pt) || pt.rev !== ref.rev) {
       badRefs.push(ref.pointId);
@@ -51,6 +78,7 @@ export function upsertRole(
     throw new OwnershipError('only the agent may write roles');
   }
   const roleInput = input as { link: string; [k: string]: unknown };
+  assertHttpUrl(roleInput.link);
   const id = roleIdFor(roleInput.link);
   const existing = repo.get('role', id);
   if (existing !== null) {
@@ -82,15 +110,27 @@ export function beginSubmit(
   if (repo.writer !== 'agent') {
     throw new OwnershipError('only the agent may write applications');
   }
+
+  let existing: Application | null = null;
+  if ('applicationId' in target) {
+    existing = repo.get('application', target.applicationId);
+    if (!existing) {
+      throw new Error(`unknown application: ${target.applicationId}`);
+    }
+    if (existing.state !== 'parked') {
+      throw new ApplicationStateError(
+        `application ${target.applicationId} is in state ${existing.state}, expected parked`,
+      );
+    }
+  } else {
+    assertHttpUrl(target.link);
+  }
+
   assertSendable(repo, intent.points);
 
   const atIso = now.toISOString();
 
-  if ('applicationId' in target) {
-    const existing = repo.get('application', target.applicationId);
-    if (!existing) {
-      throw new Error(`unknown application: ${target.applicationId}`);
-    }
+  if (existing) {
     const updated: Application = {
       ...existing,
       state: 'submitting',
@@ -105,14 +145,15 @@ export function beginSubmit(
     repo.put('application', updated);
     return updated;
   } else {
+    const input = target as ApplicationInput;
     const id = newId(now);
     const app: Application = {
       id,
-      roleId: target.roleId,
-      organization: target.organization,
-      title: target.title,
-      link: target.link,
-      sourceId: target.sourceId,
+      roleId: input.roleId,
+      organization: input.organization,
+      title: input.title,
+      link: input.link,
+      sourceId: input.sourceId,
       state: 'submitting',
       pendingSubmission: {
         resumeFile: intent.resumeFile,
@@ -143,7 +184,21 @@ export function recordOutcome(
     throw new OwnershipError('only the agent may write applications');
   }
 
+  // Validate outcome type (B25)
+  if (outcome.type !== 'park' && outcome.type !== 'submitted' && outcome.type !== 'skipped') {
+    throw new Error(`unknown outcome type: ${(outcome as any).type}`);
+  }
+
+  // Validate park afterSubmit (B24)
+  if (outcome.type === 'park' && outcome.park.afterSubmit && outcome.park.type !== 'error') {
+    throw new Error(`afterSubmit is only valid on error parks, got ${outcome.park.type}`);
+  }
+
+  // Validate skip hardNoPointId (B6 / L2)
   if (outcome.type === 'skipped') {
+    if (!isValidPointId(outcome.hardNoPointId)) {
+      throw new UnsendablePointError(`invalid hardNoPointId: ${outcome.hardNoPointId}`);
+    }
     const pt = repo.get('point', outcome.hardNoPointId);
     if (!pt || !isSendable(pt) || pt.kind !== 'hard_no') {
       throw new UnsendablePointError(`hard no point ${outcome.hardNoPointId} is not a sendable hard_no`);
@@ -158,8 +213,24 @@ export function recordOutcome(
     if (!existing) {
       throw new Error(`unknown application: ${target.applicationId}`);
     }
+
+    // State check for existing application (B23)
+    if (outcome.type === 'park' || outcome.type === 'skipped') {
+      if (existing.state !== 'submitting' && existing.state !== 'parked') {
+        throw new ApplicationStateError(
+          `application ${target.applicationId} is in state ${existing.state}, cannot record ${outcome.type}`,
+        );
+      }
+    }
+
+    if (outcome.type === 'submitted' && existing.state === 'submitted') {
+      // The one exception: if already submitted, return unchanged
+      return existing;
+    }
+
     base = { ...existing };
   } else {
+    assertHttpUrl(target.link);
     base = {
       id: newId(now),
       roleId: target.roleId,

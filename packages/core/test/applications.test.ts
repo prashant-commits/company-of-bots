@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from 'vitest';
 import {
+  ApplicationStateError,
   CONFIRMED,
   UNSURE,
   UnsendablePointError,
@@ -10,6 +11,8 @@ import {
   sendablePoints,
   upsertRole,
 } from '../src/applications.ts';
+import { createCommand } from '../src/commands.ts';
+import { processQueue } from '../src/process.ts';
 import { OwnershipError } from '../src/repo.ts';
 import { DataRepo } from '../src/repo.ts';
 import type { Application, Park } from '../src/schema.ts';
@@ -83,6 +86,8 @@ describe('applications', () => {
     );
     expect(a.park).toMatchObject({ type: 'error', note: 'Upload failed' });
     expect(a.park!.afterSubmit).toBeUndefined();
+    createCommand(app, { verb: 'retry', target: a.id, payload: {} });
+    expect(processQueue(agent)).toHaveLength(1);
   });
 
   test('parks keep history', () => {
@@ -285,5 +290,261 @@ describe('applications', () => {
         { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
       ),
     ).toThrowError(/nonexistent-id/);
+  });
+
+  // B20 (H1)
+  test.each(['submitting', 'submitted', 'skipped', 'done', 'dropped'] as const)(
+    'B20 beginSubmit with { applicationId } throws ApplicationStateError when state is %s',
+    (state) => {
+      app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+      let appRecord: Application;
+      if (state === 'submitting') {
+        appRecord = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+      } else if (state === 'submitted') {
+        const s = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+        appRecord = recordOutcome(agent, { applicationId: s.id }, { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+      } else if (state === 'skipped') {
+        app.put('point', sample.point({ id: 'hn', kind: 'hard_no', rank: CONFIRMED, rev: 1 }));
+        appRecord = recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: 'hn' }, new Date(T0));
+      } else if (state === 'done') {
+        const p = seedPark('p-done', { type: 'captcha' });
+        createCommand(app, { verb: 'done', target: p.id, payload: {} }, new Date(T0));
+        processQueue(agent, new Date(T0));
+        appRecord = agent.get('application', p.id)!;
+      } else {
+        const p = seedPark('p-drop', { type: 'captcha' });
+        createCommand(app, { verb: 'drop', target: p.id, payload: {} }, new Date(T0));
+        processQueue(agent, new Date(T0));
+        appRecord = agent.get('application', p.id)!;
+      }
+      expect(appRecord.state).toBe(state);
+      const before = agent.get('application', appRecord.id);
+      expect(() =>
+        beginSubmit(
+          agent,
+          { applicationId: appRecord.id },
+          { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+          new Date(T1),
+        ),
+      ).toThrow(ApplicationStateError);
+      const after = agent.get('application', appRecord.id);
+      expect(after).toEqual(before);
+    },
+  );
+
+  // B23 (M1)
+  test.each(['submitted', 'done', 'dropped', 'skipped'] as const)(
+    'B23 recordOutcome with park or skipped on %s throws ApplicationStateError and writes nothing',
+    (state) => {
+      app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+      app.put('point', sample.point({ id: 'hn', kind: 'hard_no', rank: CONFIRMED, rev: 1 }));
+      let appRecord: Application;
+      if (state === 'submitted') {
+        const s = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+        appRecord = recordOutcome(agent, { applicationId: s.id }, { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+      } else if (state === 'skipped') {
+        appRecord = recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: 'hn' }, new Date(T0));
+      } else if (state === 'done') {
+        const p = seedPark('p-done2', { type: 'captcha' });
+        createCommand(app, { verb: 'done', target: p.id, payload: {} }, new Date(T0));
+        processQueue(agent, new Date(T0));
+        appRecord = agent.get('application', p.id)!;
+      } else {
+        const p = seedPark('p-drop2', { type: 'captcha' });
+        createCommand(app, { verb: 'drop', target: p.id, payload: {} }, new Date(T0));
+        processQueue(agent, new Date(T0));
+        appRecord = agent.get('application', p.id)!;
+      }
+      const before = agent.get('application', appRecord.id);
+      expect(() =>
+        recordOutcome(agent, { applicationId: appRecord.id }, { type: 'park', park: { type: 'captcha' } }, new Date(T1)),
+      ).toThrow(ApplicationStateError);
+      expect(() =>
+        recordOutcome(agent, { applicationId: appRecord.id }, { type: 'skipped', hardNoPointId: 'hn' }, new Date(T1)),
+      ).toThrow(ApplicationStateError);
+      expect(agent.get('application', appRecord.id)).toEqual(before);
+    },
+  );
+
+  // B23 (M1) submitted idempotent on already submitted
+  test('B23 recordOutcome submitted on already submitted returns existing record unchanged', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const s = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+    const first = recordOutcome(agent, { applicationId: s.id }, { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+    const second = recordOutcome(agent, { applicationId: s.id }, { type: 'submitted', resumeFile: 'other.pdf', points: [] }, new Date(T1));
+    expect(second).toEqual(first);
+    expect(agent.get('application', s.id)).toEqual(first);
+  });
+
+  // B23 (M1) submitted always recorded even from done or dropped
+  test('B23 recordOutcome submitted on done or dropped application records submission', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const p = seedPark('p-done-sub', { type: 'captcha' });
+    createCommand(app, { verb: 'done', target: p.id, payload: {} }, new Date(T0));
+    processQueue(agent, new Date(T0));
+    expect(agent.get('application', p.id)!.state).toBe('done');
+
+    const result = recordOutcome(
+      agent,
+      { applicationId: p.id },
+      { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+      new Date(T1),
+    );
+    expect(result.state).toBe('submitted');
+    expect(result.submission).toMatchObject({ resumeFile: 'cv.pdf', submittedAt: T1 });
+    expect(agent.get('application', p.id)!.state).toBe('submitted');
+  });
+
+  // B24 (L3)
+  test('B24 recordOutcome with afterSubmit true on non-error park throws Error and writes nothing', () => {
+    expect(() =>
+      recordOutcome(
+        agent,
+        appInput(),
+        { type: 'park', park: { type: 'captcha', afterSubmit: true, note: 'captcha after submit' } },
+        new Date(T0),
+      ),
+    ).toThrow();
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // B25 (L4)
+  test('B25 recordOutcome with unknown outcome type throws Error and writes nothing', () => {
+    expect(() =>
+      recordOutcome(
+        agent,
+        appInput(),
+        { type: 'done' } as any,
+        new Date(T0),
+      ),
+    ).toThrow();
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // B26 (L6)
+  test('B26 beginSubmit, recordOutcome and upsertRole throw when link is not http or https', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const badLinks = [
+      'javascript:alert(document.cookie)',
+      'file:///etc/passwd',
+      'data:text/html,<script>1</script>',
+    ];
+    for (const link of badLinks) {
+      expect(() =>
+        upsertRole(agent, roleInput({ link }), new Date(T0)),
+      ).toThrow();
+      expect(() =>
+        beginSubmit(
+          agent,
+          appInput({ link }),
+          { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+          new Date(T0),
+        ),
+      ).toThrow();
+      expect(() =>
+        recordOutcome(
+          agent,
+          appInput({ link }),
+          { type: 'park', park: { type: 'human' } },
+          new Date(T0),
+        ),
+      ).toThrow();
+    }
+    expect(agent.list('role').items).toEqual([]);
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // L2 / B2
+  test('B2 assertSendable with unsafe or non-id-shaped pointId throws UnsendablePointError', () => {
+    const badPointIds = ['../../cob', 'Notice period', '', 'a/b'];
+    for (const badId of badPointIds) {
+      expect(() =>
+        assertSendable(agent, [{ pointId: badId, rev: 1 }]),
+      ).toThrow(UnsendablePointError);
+    }
+    expect(() =>
+      assertSendable(agent, [{ pointId: 'p1', rev: 0 }]),
+    ).toThrow(UnsendablePointError);
+    expect(() =>
+      assertSendable(agent, [{ pointId: 'p1', rev: '1' as any }]),
+    ).toThrow(UnsendablePointError);
+  });
+
+  // L2 / B6
+  test('B6 recordOutcome skipped with non-id-shaped hardNoPointId throws UnsendablePointError', () => {
+    expect(() =>
+      recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: '../x' }, new Date(T0)),
+    ).toThrow(UnsendablePointError);
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // m04 [B2]
+  test('B2 m04 beginSubmit with bad ref on existing application leaves it unchanged', () => {
+    const parked = seedPark('p-existing-m04', { type: 'captcha' });
+    const before = agent.get('application', parked.id);
+    expect(() =>
+      beginSubmit(
+        agent,
+        { applicationId: parked.id },
+        { resumeFile: 'cv.pdf', points: [{ pointId: 'missing-point', rev: 1 }] },
+        new Date(T1),
+      ),
+    ).toThrow(UnsendablePointError);
+    const after = agent.get('application', parked.id);
+    expect(after).toEqual(before);
+  });
+
+  // m11 [B5]
+  test('B5 m11 recordOutcome park sets park.at to now', () => {
+    const a = recordOutcome(agent, appInput(), { type: 'park', park: { type: 'captcha' } }, new Date(T1));
+    expect(a.park!.at).toBe(T1);
+  });
+
+  // m12 [B6]
+  test('B6 m12 skip refuses an unsure hard_no', () => {
+    app.put('point', sample.point({ id: 'hu', kind: 'hard_no', rank: UNSURE, rev: 1 }));
+    expect(() =>
+      recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: 'hu' }, new Date(T0)),
+    ).toThrow(UnsendablePointError);
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // m14 [B6]
+  test('B6 m14 skip with refused point writes nothing to disk', () => {
+    app.put('point', sample.point({ id: 's', kind: 'skill', rank: CONFIRMED, rev: 1 }));
+    expect(() =>
+      recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: 's' }, new Date(T0)),
+    ).toThrow(UnsendablePointError);
+    expect(agent.list('application').items).toEqual([]);
+  });
+
+  // m20 [D5]
+  test('D5 m20 recordOutcome on existing application updates updatedAt', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const p = seedPark('p-upd-m20', { type: 'captcha' });
+    expect(p.updatedAt).toBe(T0);
+    const updated = recordOutcome(
+      agent,
+      { applicationId: p.id },
+      { type: 'park', park: { type: 'human' } },
+      new Date(T1),
+    );
+    expect(updated.updatedAt).toBe(T1);
+    expect(agent.get('application', p.id)!.updatedAt).toBe(T1);
+  });
+
+  // m21 [D5]
+  test('D5 m21 beginSubmit on existing application updates updatedAt', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const p = seedPark('p-upd-m21', { type: 'captcha' });
+    expect(p.updatedAt).toBe(T0);
+    const updated = beginSubmit(
+      agent,
+      { applicationId: p.id },
+      { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
+      new Date(T1),
+    );
+    expect(updated.updatedAt).toBe(T1);
+    expect(agent.get('application', p.id)!.updatedAt).toBe(T1);
   });
 });

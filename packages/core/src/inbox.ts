@@ -93,7 +93,7 @@ export function inboxRows(
       title: app.title,
       link: app.link,
       parkedAt: park.at,
-      buttons: BUTTONS[rowType],
+      buttons: [...BUTTONS[rowType]],
       pending,
     };
 
