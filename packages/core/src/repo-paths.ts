@@ -183,7 +183,7 @@ export function recordRelPath(kindDir: string, id: string): string {
  */
 export function atomicWrite(absPath: string, data: string | Uint8Array): void {
   const dir = nodePath.dirname(absPath);
-  fs.mkdirSync(dir, { recursive: true });
+  const created = fs.mkdirSync(dir, { recursive: true });
   const tmp = nodePath.join(dir, tempNameFor(nodePath.basename(absPath)));
   try {
     const fd = fs.openSync(tmp, 'w');
@@ -203,6 +203,15 @@ export function atomicWrite(absPath: string, data: string | Uint8Array): void {
     throw e;
   }
   syncFolder(dir);
+  // Folders made just now: each one's entry in its parent must reach the disk too, up to the first one made (G9).
+  if (created !== undefined) {
+    for (let d = dir, i = 0; i < 64; d = nodePath.dirname(d), i++) {
+      const parent = nodePath.dirname(d);
+      if (parent === d) break;
+      syncFolder(parent);
+      if (nodePath.resolve(d) === nodePath.resolve(created)) break;
+    }
+  }
 }
 
 /** Flush a folder's entries (the rename) to the disk. POSIX only: Windows cannot open a folder this way. */
@@ -237,10 +246,13 @@ export function withoutLocalPaths(repoDir: string, text: string): string {
     // not there: only the spelling we were given
   }
   let out = text;
+  // The folder's path only where it stands on its own: not inside a longer path (`/x/data/app`), and not as the
+  // prefix of a sibling (`/data/app2` when the folder is `/data/app`) (G10).
+  const before = `(?<![\\w.~/\\\\-])`;
   for (const root of [...roots].sort((a, b) => b.length - a.length)) {
-    const inside = new RegExp(`${escapeRegExp(root)}[\\\\/]([^\\s'"\`]*)`, 'g');
+    const inside = new RegExp(`${before}${escapeRegExp(root)}[\\\\/]([^\\s'"\`]*)`, 'g');
     out = out.replace(inside, (_m, rest: string) => rest.replace(/\\/g, '/'));
-    out = out.split(root).join('.');
+    out = out.replace(new RegExp(`${before}${escapeRegExp(root)}(?![^\\s'"\`:,;)\\]])`, 'g'), '.');
   }
   return out;
 }

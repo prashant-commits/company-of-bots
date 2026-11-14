@@ -214,9 +214,10 @@ export function beginSubmit(
     if (!existing) {
       throw new Error(`unknown application: ${target.applicationId}`);
     }
-    if (existing.state !== 'parked') {
+    // A skipped posting may be started again (R57): a skip never involved a click.
+    if (existing.state !== 'parked' && existing.state !== 'skipped') {
       throw new ApplicationStateError(
-        `application ${target.applicationId} is in state ${existing.state}, expected parked`,
+        `application ${target.applicationId} is in state ${existing.state}, expected parked or skipped`,
       );
     }
     if (existing.park?.type === 'error' && existing.park.afterSubmit) {
@@ -243,6 +244,7 @@ export function beginSubmit(
         startedAt: atIso,
       },
       park: null,
+      skip: null,
       updatedAt: atIso,
     };
     repo.put('application', updated);

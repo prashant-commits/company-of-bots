@@ -12,7 +12,7 @@ import {
   resolveRepoPath,
   type PathOptions,
 } from './repo-paths.ts';
-import { isOsJunk, isSecretLookingPath, isTmpArtifactName } from './names.ts';
+import { isIgnoredByLayout, isOsJunk, isSecretLookingPath, isTmpArtifactName } from './names.ts';
 import { RepoMetaSchema, SCHEMA_VERSION } from './schema.ts';
 import type { DayLog, Transcript } from './schema.ts';
 
@@ -310,6 +310,10 @@ export class DataRepo {
   writeBlob(relPath: string, bytes: Uint8Array): void {
     const abs = this.resolve(relPath);
     assertBlobWriteDeletePath(relPath, this.writer);
+    if (isIgnoredByLayout(relPath)) {
+      // git would ignore it, so it would never reach the other checkout: refuse it here, where it can be renamed.
+      throw new UnsafeNameError(`${relPath} has a name the data repo's .gitignore keeps out of git; rename the file`);
+    }
     atomicWrite(abs, bytes);
   }
 

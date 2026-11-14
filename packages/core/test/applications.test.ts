@@ -292,8 +292,8 @@ describe('applications', () => {
     ).toThrowError(/nonexistent-id/);
   });
 
-  // B20 (H1)
-  test.each(['submitting', 'submitted', 'skipped', 'done', 'dropped'] as const)(
+  // B20 (H1), amended by R57: a skipped application may be started again (review-fix1.test.ts G3)
+  test.each(['submitting', 'submitted', 'done', 'dropped'] as const)(
     'B20 beginSubmit with { applicationId } throws ApplicationStateError when state is %s',
     (state) => {
       app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
@@ -303,9 +303,6 @@ describe('applications', () => {
       } else if (state === 'submitted') {
         const s = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
         appRecord = recordOutcome(agent, { applicationId: s.id }, { type: 'submitted', resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
-      } else if (state === 'skipped') {
-        app.put('point', sample.point({ id: 'hn', kind: 'hard_no', rank: CONFIRMED, rev: 1 }));
-        appRecord = recordOutcome(agent, appInput(), { type: 'skipped', hardNoPointId: 'hn' }, new Date(T0));
       } else if (state === 'done') {
         const p = seedPark('p-done', { type: 'captcha' });
         createCommand(app, { verb: 'done', target: p.id, payload: {} }, new Date(T0));

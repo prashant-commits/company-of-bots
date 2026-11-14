@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PRIVATE_REPO_NOTICE } from './copy.ts';
+import { LAYOUT_IGNORE_LINES } from './names.ts';
 import { DataRepo } from './repo.ts';
 import { SCHEMA_VERSION } from './schema.ts';
 import type { Lane } from './schema.ts';
@@ -37,12 +38,7 @@ One source is one file, named after its id (for example \`s1.json\`):
 - \`addedBy\` is \`user\` or \`interview\`.
 `;
 
-const GITIGNORE = `cookies/
-*.cookies.json
-storage-state*.json
-secrets/
-.env*
-`;
+const GITIGNORE = `${LAYOUT_IGNORE_LINES.join('\n')}\n`;
 
 const README = `# Your private data repo
 

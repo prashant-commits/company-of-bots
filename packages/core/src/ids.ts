@@ -16,7 +16,11 @@ export function newId(now: Date = new Date()): string {
 
 const TRACKING = /^(utm_.*|gclid|fbclid|ref)$/i;
 
-/** Stable role id from a posting link, ignoring tracking params, hash, trailing slash and host case. */
+/**
+ * Stable role id from a posting link, ignoring tracking params, the fragment, a trailing slash and host case.
+ * A fragment that is a route (`#/job/101`, `#!/view/101`), as single-page job sites use, is kept: it names the
+ * posting (R57). `ref` stays a tracking parameter: reading one job as two would risk a second application.
+ */
 export function roleIdFor(link: string): string {
   const url = new URL(link);
   const params = [...url.searchParams.entries()]
@@ -24,7 +28,8 @@ export function roleIdFor(link: string): string {
     .sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0));
   const query = new URLSearchParams(params).toString();
   const path = url.pathname.replace(/\/$/, '');
-  const canonical = `${url.protocol}//${url.host.toLowerCase()}${path}${query ? `?${query}` : ''}`;
+  const route = /^#[/!]/.test(url.hash) ? url.hash : '';
+  const canonical = `${url.protocol}//${url.host.toLowerCase()}${path}${query ? `?${query}` : ''}${route}`;
   return `r-${createHash('sha256').update(canonical).digest('hex').slice(0, 16)}`;
 }
 

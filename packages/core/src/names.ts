@@ -34,6 +34,27 @@ export function isSecretLookingPath(relPath: string): boolean {
   return !RESUME_FILE.test(relPath) && SECRET_NAME.test(relPath);
 }
 
+/**
+ * The data repo's `.gitignore`, as the layout writes it: cookie and secret files are kept out of git at the
+ * source. Each line is a folder name (`name/`) or a file-name glob, matched at any depth.
+ */
+export const LAYOUT_IGNORE_LINES = ['cookies/', '*.cookies.json', 'storage-state*.json', 'secrets/', '.env*'] as const;
+
+const IGNORE_RULES = LAYOUT_IGNORE_LINES.map((line) => ({
+  folder: line.endsWith('/'),
+  re: new RegExp(`^${line.replace(/\/$/, '').replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')}$`, 'i'),
+}));
+
+/**
+ * Whether git would ignore this repo-relative `/` path under the layout's `.gitignore` (letter case ignored, as on
+ * Windows and macOS). `DataRepo` refuses to write such a file: it would never be synced (G7).
+ */
+export function isIgnoredByLayout(relPath: string): boolean {
+  const parts = relPath.split('/');
+  const name = parts[parts.length - 1] ?? '';
+  return IGNORE_RULES.some((r) => (r.folder ? parts.slice(0, -1).some((s) => r.re.test(s)) : r.re.test(name)));
+}
+
 const OS_JUNK = new Set(['.ds_store', 'thumbs.db', 'ehthumbs.db', 'desktop.ini']);
 
 /** Files the operating system drops into a folder the user opens (Finder, Explorer). Never synced. */
