@@ -465,7 +465,7 @@ describe('process', () => {
   // N1 / r11: verified never authorises may-have-been-sent row
   test('N1 / r11: verified never authorises may-have-been-sent row', () => {
     const s = seedInterruptedSubmit('p-verified-after-submit');
-    const c = createCommand(app, { verb: 'verified', target: s.id, payload: {} }, new Date(T1));
+    const c = createCommand(app, { verb: 'verified', target: s.id, payload: { notSent: true, parkAt: s.park!.at } } as any, new Date(T1));
     expect(processQueue(agent)).toEqual([]);
     expect(agent.get('command', c.id)).toMatchObject({
       state: 'failed',
@@ -488,6 +488,7 @@ describe('process', () => {
     expect(updatedApp.park!.type).toBe('error');
     expect(updatedApp.park!.at).toBe(parkAt);
     expect(updatedApp.park!.afterSubmit).toBeUndefined();
+    expect(updatedApp.pendingSubmission).toBeNull();
     expect(updatedApp.park!.note).toBe(`${origNote} — user confirmed not sent`);
     expect(updatedApp.updatedAt).toBe(confirmTime.toISOString());
 
@@ -499,5 +500,62 @@ describe('process', () => {
       new Date('2026-11-11T11:01:00.000Z'),
     );
     expect(sub.state).toBe('submitting');
+  });
+
+  // N6: Done after an accepted "not sent" answer records done, not submitted
+  test('N6: Done after accepted notSent answer closes row as done with submission null', () => {
+    const s = seedInterruptedSubmit('p-n6');
+    const parkAt = s.park!.at;
+
+    // Retry with notSent: true is accepted
+    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt } }, new Date(T1));
+    processQueue(agent, new Date(T1));
+    const appAfterRetry = agent.get('application', s.id)!;
+    expect(appAfterRetry.pendingSubmission).toBeNull();
+
+    // Later Done command arrives
+    const d = createCommand(app, { verb: 'done', target: s.id, payload: {} }, new Date('2026-11-11T10:30:00.000Z'));
+    processQueue(agent, new Date('2026-11-11T10:35:00.000Z'));
+
+    const appAfterDone = agent.get('application', s.id)!;
+    expect(appAfterDone.state).toBe('done');
+    expect(appAfterDone.submission).toBeNull();
+    expect(appAfterDone.pendingSubmission).toBeNull();
+    expect(agent.get('command', d.id)!.resultNote).toBe('closed: finished by user');
+  });
+
+  // N7: B27 keeps site, contact, fields and handles park with no note
+  test('N7: B27 keeps site, contact, fields and handles park with no note', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const s = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+    const parked = recordOutcome(
+      agent,
+      { applicationId: s.id },
+      {
+        type: 'park',
+        park: {
+          type: 'error',
+          afterSubmit: true,
+          site: 'jobs.example.com',
+          contact: 'hr@example.com',
+          fields: ['fieldA', 'fieldB'],
+        },
+      },
+      new Date(T1),
+    );
+    expect(parked.park!.note).toBeUndefined();
+
+    const c = createCommand(
+      app,
+      { verb: 'retry', target: s.id, payload: { notSent: true, parkAt: parked.park!.at } },
+      new Date('2026-11-11T10:30:00.000Z'),
+    );
+    processQueue(agent, new Date('2026-11-11T10:31:00.000Z'));
+
+    const updated = agent.get('application', s.id)!;
+    expect(updated.park!.site).toBe('jobs.example.com');
+    expect(updated.park!.contact).toBe('hr@example.com');
+    expect(updated.park!.fields).toEqual(['fieldA', 'fieldB']);
+    expect(updated.park!.note).toBe('user confirmed not sent');
   });
 });

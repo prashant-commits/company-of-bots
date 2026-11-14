@@ -125,6 +125,7 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
               ...app,
               state: 'done' as const,
               park: null,
+              pendingSubmission: null,
               closedAt: atIso,
               updatedAt: atIso,
             };
@@ -153,7 +154,7 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
                   note: 'failed: confirm the application was not sent before retrying',
                 };
               } else {
-                // Row B27 (N2)
+                // Row B27 (N2, N6)
                 const { afterSubmit: _afterSubmit, ...restPark } = app.park;
                 const baseNote = app.park.note ?? '';
                 const newNote = baseNote
@@ -167,6 +168,7 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
                 };
                 const updatedApp = {
                   ...app,
+                  pendingSubmission: null,
                   park: updatedPark,
                   updatedAt: atIso,
                 };

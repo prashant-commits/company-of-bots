@@ -600,4 +600,109 @@ describe('applications', () => {
     expect(updated.updatedAt).toBe(T1);
     expect(agent.get('application', p.id)!.updatedAt).toBe(T1);
   });
+
+  // B23 amended (N5): recordOutcome park (unless error + afterSubmit) or skipped on error with afterSubmit throws ApplicationStateError
+  test('B23 amended (N5): recordOutcome with plain park or skipped on error with afterSubmit throws ApplicationStateError and writes nothing', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    app.put('point', sample.point({ id: 'hn', kind: 'hard_no', rank: CONFIRMED, rev: 1 }));
+    const s = seedInterruptedSubmit('p1');
+    expect(s.park?.type).toBe('error');
+    expect(s.park?.afterSubmit).toBe(true);
+
+    const before = agent.get('application', s.id)!;
+
+    // Plain park (e.g. sign_in) throws ApplicationStateError and writes nothing
+    let thrownPark: unknown;
+    try {
+      recordOutcome(
+        agent,
+        { applicationId: s.id },
+        { type: 'park', park: { type: 'sign_in', site: 'jobs.example.com' } },
+        new Date(T1),
+      );
+    } catch (err) {
+      thrownPark = err;
+    }
+    expect(thrownPark).toBeInstanceOf(ApplicationStateError);
+    expect((thrownPark as Error).message).toContain(s.id);
+    expect((thrownPark as Error).message).toContain(s.state);
+    expect(agent.get('application', s.id)).toEqual(before);
+
+    // Skipped throws ApplicationStateError and writes nothing
+    let thrownSkip: unknown;
+    try {
+      recordOutcome(
+        agent,
+        { applicationId: s.id },
+        { type: 'skipped', hardNoPointId: 'hn' },
+        new Date(T1),
+      );
+    } catch (err) {
+      thrownSkip = err;
+    }
+    expect(thrownSkip).toBeInstanceOf(ApplicationStateError);
+    expect((thrownSkip as Error).message).toContain(s.id);
+    expect((thrownSkip as Error).message).toContain(s.state);
+    expect(agent.get('application', s.id)).toEqual(before);
+
+    // Recording another error park with afterSubmit: true IS allowed
+    const secondErrorPark = recordOutcome(
+      agent,
+      { applicationId: s.id },
+      { type: 'park', park: { type: 'error', afterSubmit: true, note: 'Second crash' } },
+      new Date(T1),
+    );
+    expect(secondErrorPark.park?.type).toBe('error');
+    expect(secondErrorPark.park?.afterSubmit).toBe(true);
+    expect(secondErrorPark.park?.note).toBe('Second crash');
+  });
+
+  // B28 (N8): new park written on application always has at strictly later than previous park at
+  test('B28 (N8): new park written on an application always has at strictly later than previous park at', () => {
+    app.put('point', sample.point({ id: 'p1', rank: CONFIRMED, rev: 1 }));
+    const p = recordOutcome(
+      agent,
+      appInput(),
+      { type: 'park', park: { type: 'captcha' } },
+      new Date(T1),
+    );
+    expect(p.park!.at).toBe(T1); // '2026-11-11T10:00:00.000Z'
+
+    // Candidate clock is same timestamp (T1) -> must become T1 + 1ms
+    const pSame = recordOutcome(
+      agent,
+      { applicationId: p.id },
+      { type: 'park', park: { type: 'human' } },
+      new Date(T1),
+    );
+    expect(pSame.park!.at).toBe('2026-11-11T10:00:00.001Z');
+    expect(pSame.parkHistory[1]!.at).toBe('2026-11-11T10:00:00.001Z');
+
+    // Candidate clock is earlier than previous park at (T0 < 10:00:00.001Z) -> must become 10:00:00.001Z + 1ms = 10:00:00.002Z
+    const pEarlier = recordOutcome(
+      agent,
+      { applicationId: p.id },
+      { type: 'park', park: { type: 'verify' } },
+      new Date(T0),
+    );
+    expect(pEarlier.park!.at).toBe('2026-11-11T10:00:00.002Z');
+    expect(pEarlier.parkHistory[2]!.at).toBe('2026-11-11T10:00:00.002Z');
+
+    // Also verify recoverInterrupted enforces B28 when candidate time is same as previous park
+    const R = new Date(T1);
+    const sub = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+    // Initial recovery at R
+    const rec1 = recoverInterrupted(agent, R);
+    expect(rec1[0]!.park!.at).toBe(T1);
+
+    // Confirm retry so beginSubmit is allowed
+    createCommand(app, { verb: 'retry', target: sub.id, payload: { notSent: true, parkAt: T1 } }, new Date('2026-11-11T10:30:00.000Z'));
+    processQueue(agent, new Date('2026-11-11T10:31:00.000Z'));
+
+    // Begin submit again, then recover with the same R
+    const subAgain = beginSubmit(agent, { applicationId: sub.id }, { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T1));
+    expect(subAgain.park).toBeNull();
+    const rec2 = recoverInterrupted(agent, R);
+    expect(rec2[0]!.park!.at).toBe('2026-11-11T10:00:00.001Z');
+  });
 });

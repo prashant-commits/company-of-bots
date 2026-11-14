@@ -179,6 +179,18 @@ export function beginSubmit(
   }
 }
 
+function nextParkAt(previousParkAt: string | undefined, candidateIso: string): string {
+  if (!previousParkAt) {
+    return candidateIso;
+  }
+  const prevMs = new Date(previousParkAt).getTime();
+  const candMs = new Date(candidateIso).getTime();
+  if (candMs <= prevMs) {
+    return new Date(prevMs + 1).toISOString();
+  }
+  return candidateIso;
+}
+
 export function recordOutcome(
   repo: DataRepo,
   target: { applicationId: string } | ApplicationInput,
@@ -219,12 +231,23 @@ export function recordOutcome(
       throw new Error(`unknown application: ${target.applicationId}`);
     }
 
-    // State check for existing application (B23)
+    // State check for existing application (B23, amended in N5)
     if (outcome.type === 'park' || outcome.type === 'skipped') {
       if (existing.state !== 'submitting' && existing.state !== 'parked') {
         throw new ApplicationStateError(
           `application ${target.applicationId} is in state ${existing.state}, cannot record ${outcome.type}`,
         );
+      }
+      if (existing.park?.type === 'error' && existing.park.afterSubmit) {
+        const isAllowedErrorAfterSubmit =
+          outcome.type === 'park' &&
+          outcome.park.type === 'error' &&
+          outcome.park.afterSubmit === true;
+        if (!isAllowedErrorAfterSubmit) {
+          throw new ApplicationStateError(
+            `application ${target.applicationId} is in state ${existing.state} (may have been sent), cannot record ${outcome.type}`,
+          );
+        }
       }
     }
 
@@ -276,12 +299,17 @@ export function recordOutcome(
       note?: string;
       afterSubmit?: boolean;
     };
+    const previousParkAt =
+      base.parkHistory.length > 0
+        ? base.parkHistory[base.parkHistory.length - 1]!.at
+        : base.park?.at;
+    const parkAt = nextParkAt(previousParkAt, atIso);
     base.state = 'parked';
     base.park = {
       ...parkInput,
-      at: atIso,
+      at: parkAt,
     };
-    base.parkHistory = [...base.parkHistory, { type: parkInput.type, at: atIso }];
+    base.parkHistory = [...base.parkHistory, { type: parkInput.type, at: parkAt }];
     if (!parkInput.afterSubmit) {
       base.pendingSubmission = null;
     }
@@ -311,6 +339,11 @@ export function recoverInterrupted(repo: DataRepo, now: Date = new Date()): Appl
   const changed: Application[] = [];
   for (const app of items) {
     if (app.state === 'submitting') {
+      const previousParkAt =
+        app.parkHistory.length > 0
+          ? app.parkHistory[app.parkHistory.length - 1]!.at
+          : app.park?.at;
+      const parkAt = nextParkAt(previousParkAt, atIso);
       const updated: Application = {
         ...app,
         state: 'parked',
@@ -318,9 +351,9 @@ export function recoverInterrupted(repo: DataRepo, now: Date = new Date()): Appl
           type: 'error',
           afterSubmit: true,
           note: 'The run stopped after the submit click. The application may have been sent.',
-          at: atIso,
+          at: parkAt,
         },
-        parkHistory: [...app.parkHistory, { type: 'error', at: atIso }],
+        parkHistory: [...app.parkHistory, { type: 'error', at: parkAt }],
         updatedAt: atIso,
       };
       repo.put('application', updated);
