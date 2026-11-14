@@ -16,6 +16,7 @@ import {
   pullRepo,
   syncRepo,
 } from '../src/git.ts';
+import { repositoryKey } from '../src/remote-key.ts';
 import { T1 as T1_ISO, bare, clean, rebaseInProgress, roleInput, sample, tmpDir } from './helpers.ts';
 
 const T = 30_000;
@@ -1855,6 +1856,13 @@ test('R16 files DataRepo writes are committed and checked out with the bytes it 
 
 // --- R17: a `main` deleted on the host is not re-uploaded ---------------------------------------------
 
+/** Snapshot without refs/cob/: R23 (amended) records what a "main is gone" refusal counted. */
+const withoutRecords = (snap: ReturnType<typeof snapshot>) => ({
+  ...snap,
+  refs: snap.refs.split('\n').filter((l) => !l.startsWith('refs/cob/')).join('\n'),
+});
+const recordLines = (snap: ReturnType<typeof snapshot>) => snap.refs.split('\n').filter((l) => l.startsWith('refs/cob/'));
+
 async function expectMainGone(dir: string): Promise<void> {
   write(dir, 'new.txt', 'new\n');
   const before = snapshot(dir);
@@ -1864,7 +1872,10 @@ async function expectMainGone(dir: string): Promise<void> {
     expect(err.message).toMatch(/gone/);
     expect(err.message).toMatch(/nothing was pushed/);
   }
-  expect(snapshot(dir)).toEqual(before);
+  const after = snapshot(dir);
+  expect(withoutRecords(after)).toEqual(withoutRecords(before));
+  if (recordLines(before).length > 0) expect(recordLines(after)).toEqual(recordLines(before));
+  else expect(recordLines(after).length).toBeGreaterThan(0); // counted from the tracking ref, and kept
   expect(sh(remote, 'for-each-ref')).toBe('');
 }
 
@@ -2208,3 +2219,177 @@ test('R22 a host rewrite that removes a commit from the middle keeps every old t
   }
   expect(remoteHistory()).not.toContain('leak.txt');
 }, T);
+
+// ===========================================================================
+// cob-d2 fix 3 (F17-F23: amended R22, R23, R25; new R26)
+// ===========================================================================
+
+/** Push a private file from `dir`, then scrub that commit on the host. */
+async function pushThenScrub(dir: string, writer: 'app' | 'agent'): Promise<void> {
+  write(dir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(dir, writer, 'transcript');
+  rewindRemote();
+}
+const scrubHeld = () => {
+  expect(remoteHistory()).not.toContain('transcript');
+  expect(sh(remote, 'log', '--format=%s', 'main')).not.toContain('transcript');
+};
+
+// --- F17 / R25: file://localhost and a relative path are the same repository -------------------------
+
+test('R25 `file://localhost` plus the absolute path is the same repository: a scrub stays scrubbed', async () => {
+  await pushThenScrub(appDir, 'app');
+  sh(appDir, 'remote', 'set-url', 'origin', `file://localhost${remote}`);
+  expect((await syncRepo(appDir, 'app', 'after')).pushed).toBe(true);
+  scrubHeld();
+}, T);
+
+test('R25 a relative path is resolved against the checkout, not the process folder: a scrub stays scrubbed', async () => {
+  await pushThenScrub(appDir, 'app');
+  const relative = path.relative(appDir, remote);
+  expect(path.relative(process.cwd(), remote)).not.toBe(relative); // the two folders differ
+  sh(appDir, 'remote', 'set-url', 'origin', relative);
+  expect((await syncRepo(appDir, 'app', 'after')).pushed).toBe(true);
+  scrubHeld();
+}, T);
+
+// --- F18 / R25: data.git and data are two repositories -------------------------------------------------
+
+test('R25 local `data.git` and `data` are two repositories: re-pointing at a copy that is behind pushes the newer commit', async () => {
+  const copy = remote.replace(/\.git$/, ''); // `…/remote` next to `…/remote.git`, a copy that is behind
+  execFileSync('git', ['clone', '-q', '--bare', remote, copy]);
+  write(appDir, 'week1.txt', 'week 1\n');
+  await syncRepo(appDir, 'app', 'week 1');
+  sh(appDir, 'remote', 'set-url', 'origin', copy);
+  write(appDir, 'week2.txt', 'week 2\n');
+  expect((await syncRepo(appDir, 'app', 'week 2')).pushed).toBe(true);
+  expect(read(appDir, 'week1.txt')).toBe('week 1\n');
+  expect(sh(copy, 'ls-tree', '-r', '--name-only', 'main')).toMatch(/^week1\.txt$/m);
+  expect(sh(copy, 'rev-parse', 'main')).toBe(sh(appDir, 'rev-parse', 'HEAD'));
+}, T);
+
+// --- F19 / R23: the tip a plain clone started with ------------------------------------------------------
+
+/** The user's own `git clone` of the remote, with an identity and no record. */
+function ownClone(): string {
+  const own = path.join(tmpDir(), 'own');
+  execFileSync('git', ['clone', '-q', remote, own]);
+  sh(own, 'config', 'user.name', 'Own');
+  sh(own, 'config', 'user.email', 'own@example.com');
+  expect(sh(own, 'for-each-ref', 'refs/cob/')).toBe('');
+  return own;
+}
+
+test('R23 a plain clone’s starting tip counts after the user’s own fetch moved the tracking ref (G7)', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  const own = ownClone(); // starts at the transcript commit; a plain clone logs nothing for origin/main
+  rewindRemote();
+  sh(own, 'fetch', '-q', 'origin'); // the user's own fetch: the clone tip is now only an old value in the log
+  expect(exists(own, 'notes/transcript.txt')).toBe(true);
+  write(own, 'work.txt', 'work\n');
+  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  scrubHeld();
+  expect(exists(own, 'notes/transcript.txt')).toBe(false);
+}, T);
+
+// --- F20 / R23: a refusal keeps what it counted --------------------------------------------------------
+
+test('R23 after "main is gone" on a checkout with no record, the user’s own `git fetch --prune` does not lead to a re-upload (G3)', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  const own = ownClone();
+  sh(remote, 'update-ref', '-d', 'refs/heads/main');
+  const first = (await syncRepo(own, 'agent', 'x').catch((e: unknown) => e)) as GitError;
+  expect(first).toBeInstanceOf(GitError);
+  expect(first.message).toMatch(/gone/);
+  sh(own, 'fetch', '-q', '--prune', 'origin');
+  expect(sh(own, 'for-each-ref', 'refs/remotes/')).toBe('');
+  const second = (await syncRepo(own, 'agent', 'y').catch((e: unknown) => e)) as GitError;
+  expect(second).toBeInstanceOf(GitError);
+  expect(second.message).toMatch(/gone/);
+  expect(sh(remote, 'for-each-ref')).toBe('');
+}, T);
+
+// --- F21 / R26: what the user's own fetch brought in at the recorded repository ----------------------------
+
+test('R26 a commit the user’s own `git pull` brought in, then dropped on the host, is not pushed back (G6)', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  sh(agentDir, 'pull', '-q', '--no-rebase', 'origin', 'main'); // by hand: core never saw this tip
+  rewindRemote();
+  write(agentDir, 'work.txt', 'work\n');
+  expect((await syncRepo(agentDir, 'agent', 'work')).pushed).toBe(true);
+  scrubHeld();
+  expect(remoteTree()).toContain('work.txt');
+}, T);
+
+test('R26 control: origin re-pointed by hand at another repository, then fetched by hand: nothing counts across (R15)', async () => {
+  const copy = path.join(tmpDir(), 'copy.git');
+  execFileSync('git', ['clone', '-q', '--bare', remote, copy]);
+  write(appDir, 'a.txt', 'a\n');
+  await syncRepo(appDir, 'app', 'a');
+  sh(appDir, 'remote', 'set-url', 'origin', copy);
+  sh(appDir, 'fetch', '-q', 'origin'); // the user's own fetch from the copy moves the tracking ref back
+  write(appDir, 'b.txt', 'b\n');
+  expect((await syncRepo(appDir, 'app', 'b')).pushed).toBe(true);
+  expect(read(appDir, 'a.txt')).toBe('a\n');
+  expect(sh(copy, 'ls-tree', '-r', '--name-only', 'main')).toMatch(/^a\.txt$[\s\S]*^b\.txt$/m);
+}, T);
+
+// --- F22 / R22: the reflog seed, the clone's line endings, the host in the key --------------------------------
+
+test('R22 seeding reads the reflog: a commit the user pulled, then the host dropped and the user fetched past, is not pushed back (G8)', async () => {
+  const own = ownClone();
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  sh(own, 'pull', '-q', '--no-rebase', 'origin', 'main'); // the transcript tip is a new value in the reflog
+  rewindRemote();
+  sh(own, 'fetch', '-q', 'origin'); // the tracking ref no longer holds it
+  write(own, 'work.txt', 'work\n');
+  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  scrubHeld();
+}, T);
+
+test('R22 cloneDataRepo makes a byte-exact checkout whatever the user’s line-ending config', async () => {
+  await withEnv(globalConfig('[core]\n\tautocrlf = true\n'), async () => {
+    const dir = path.join(tmpDir(), 'c');
+    await cloneDataRepo(remote, dir, identity);
+    expect(sh(dir, 'config', '--local', 'core.autocrlf').trim()).toBe('false');
+    for (const rel of ['README.md', 'guide/lanes.json', '.gitignore']) {
+      expect(fs.readFileSync(path.join(dir, rel)).includes(0x0d), rel).toBe(false);
+    }
+    const crlf = Buffer.from('a\r\nb\r\n');
+    new DataRepo(dir, 'agent').writeBlob('profile/resumes/cv.txt', new Uint8Array(crlf));
+    expect((await syncRepo(dir, 'agent', 'cv')).pushed).toBe(true);
+    expect(Buffer.from(execFileSync('git', ['cat-file', 'blob', 'main:profile/resumes/cv.txt'], { cwd: remote }))).toEqual(crlf);
+  });
+}, T);
+
+test('R22/R25 the repository key: one repository per host and path, however it is spelled', () => {
+  const posix = (a: string, base = '/work/app') => repositoryKey(a, base, { pathApi: path.posix });
+  const win = (a: string, base = 'C:\\work\\app') => repositoryKey(a, base, { pathApi: path.win32 });
+  const same = (f: (a: string) => string, ...spellings: string[]) => {
+    for (const s of spellings) expect(f(s), s).toBe(f(spellings[0]!));
+  };
+  same(
+    posix,
+    'https://tok1@example.com/me/data.git',
+    'https://tok2@example.com/me/data.git/',
+    'https://someone:x@Example.COM:8443/me/data',
+    'git@example.com:me/data.git',
+    'ssh://git@example.com:22/me/data.git',
+  );
+  same(posix, '/srv/data.git', '/srv/data.git/', 'file:///srv/data.git', 'file://localhost/srv/data.git', '../../srv/data.git');
+  // Never one repository: another host, another path, `data.git` against `data` on disk.
+  expect(posix('https://example.com/me/data.git')).not.toBe(posix('https://example.org/me/data.git'));
+  expect(posix('git@example.com:me/data.git')).not.toBe(posix('git@example.net:me/data.git'));
+  expect(posix('https://example.com/me/data.git')).not.toBe(posix('https://example.com/me/other.git'));
+  expect(posix('/srv/data.git')).not.toBe(posix('/srv/data'));
+  expect(posix('/srv/data.git')).not.toBe(posix('https://srv/data.git'));
+  // Windows: drive paths in both slash styles, file:///C:/…, case; UNC and file://server/share/….
+  same(win, 'C:/Users/data.git', 'C:\\Users\\data.git', 'c:\\users\\DATA.git\\', 'file:///C:/Users/data.git', 'file://localhost/C:/Users/data.git', '..\\..\\Users\\data.git');
+  same(win, '\\\\server\\share\\data.git', '\\\\SERVER\\share\\data.git\\', 'file://server/share/data.git');
+  expect(win('C:/Users/data.git')).not.toBe(win('C:/Users/data'));
+  expect(win('\\\\server\\share\\data.git')).not.toBe(win('\\\\other\\share\\data.git'));
+});

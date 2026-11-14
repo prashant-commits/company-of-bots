@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { initDataLayout } from './init.ts';
 import { ownerOfPath, type Writer } from './layout.ts';
+import { repositoryKey } from './remote-key.ts';
 
 export type GitIdentity = { name: string; email: string };
 
@@ -1098,45 +1099,8 @@ const SEEN_IDENTITY: Record<string, string> = {
   GIT_COMMITTER_EMAIL: 'sync@company-of-bots.invalid',
 };
 
-/**
- * The repository an address names, for the seen record (R25): host (lower case, without user info or port)
- * and path (without trailing slashes or a `.git` suffix). The https, ssh and scp-like (`user@host:path`)
- * forms of one host and path are one repository; so are a local path and its `file://` URL.
- */
-function repositoryKey(address: string): string {
-  const a = address.trim();
-  let host = '';
-  let p: string;
-  const url = /^([a-z][a-z0-9+.-]*):\/\/([^/]*)(.*)$/i.exec(a);
-  const scp = /^(?:[^@/]+@)?([^:/\\]{2,}):(?!\/\/)(.*)$/.exec(a);
-  if (url) {
-    const authority = url[2]!;
-    host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '').toLowerCase();
-    p = url[3] || '/';
-    if (url[1]!.toLowerCase() === 'file') {
-      try {
-        p = decodeURIComponent(p);
-      } catch {
-        // keep it as written
-      }
-    }
-  } else if (scp) {
-    host = scp[1]!.toLowerCase();
-    p = `/${scp[2]!.replace(/^\/+/, '')}`;
-  } else {
-    p = path.resolve(a);
-  }
-  p = p.replace(/\/{2,}/g, '/').replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/+$/, '');
-  return `${host}\n${p}`;
-}
-
-function seenRef(address: string): string {
-  return SEEN_PREFIX + createHash('sha256').update(repositoryKey(address)).digest('hex').slice(0, 32);
-}
-
-/** The record name be6b77c used (keyed on the raw address), so such a record carries over. */
-function legacySeenRef(address: string): string {
-  return SEEN_PREFIX + createHash('sha256').update(address).digest('hex').slice(0, 32);
+function seenRef(dir: string, address: string): string {
+  return SEEN_PREFIX + createHash('sha256').update(repositoryKey(address, dir)).digest('hex').slice(0, 32);
 }
 
 /** `origin`'s address as configured (its first URL). Throws `GitError` if there is no `origin`. */
@@ -1149,30 +1113,85 @@ async function originAddress(dir: string): Promise<string> {
   return raw || expanded;
 }
 
+const SEEN_SUBJECT = 'cob: tips seen on origin/main';
+
 /**
- * Tips that count as seen at `address` although its record does not exist yet (R23). Read-only: the caller
- * records them once the fetch is accepted.
- * - A record made under be6b77c's raw-address name carries over.
- * - A checkout with no record at all (the user's own clone, older code, `refs/cob/` removed) counts the
- *   tracking ref's tip and the tips in its reflog, read before anything moves that ref.
- * A checkout that has a record for another address gets nothing from the tracking ref (R15).
+ * Every value the tracking ref has had that still exists, oldest first: the old and the new value of each
+ * reflog entry (a plain clone logs nothing, so its starting tip shows only as the old value of the first
+ * fetch after it), then the ref itself.
+ */
+async function trackingValues(dir: string): Promise<string[]> {
+  const tracking = `refs/remotes/${REMOTE}/${BRANCH}`;
+  const values: string[] = [];
+  const logFile = path.resolve(dir, (await git(dir, ['rev-parse', '--git-path', `logs/${tracking}`])).trim());
+  let text: string | null = null;
+  try {
+    text = fs.readFileSync(logFile, 'latin1');
+  } catch {
+    text = null;
+  }
+  if (text !== null) {
+    for (const line of text.split('\n')) {
+      const m = /^([0-9a-f]{40,64}) ([0-9a-f]{40,64}) /.exec(line);
+      if (m) values.push(m[1]!, m[2]!);
+    }
+  } else {
+    // A ref store without log files: the new values are all git will show.
+    const logged = await git(dir, ['reflog', 'show', '--no-abbrev', '--format=%H', tracking, '--']).catch(() => '');
+    values.push(...logged.split('\n').filter((l) => /^[0-9a-f]{40,64}$/.test(l)).reverse());
+  }
+  const tip = await revOrNull(dir, tracking);
+  if (tip !== null) values.push(tip);
+  const unique = [...new Set(values.filter((v) => !/^0+$/.test(v)))];
+  if (unique.length === 0) return [];
+  const types = await run(dir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input: `${unique.join('\n')}\n` });
+  const commits = new Set(types.split('\n').filter((l) => l.endsWith(' commit')).map((l) => l.split(' ')[0]!));
+  return unique.filter((v) => commits.has(v));
+}
+
+/** The real tips a record holds: the record itself, or the parents of the commits recordSeen made. */
+async function recordTips(dir: string, record: string): Promise<string[]> {
+  const out: string[] = [];
+  const stack = [record];
+  const visited = new Set<string>();
+  while (stack.length > 0) {
+    const c = stack.pop()!;
+    if (visited.has(c)) continue;
+    visited.add(c);
+    const [email, subject, parents] = (await git(dir, ['log', '-1', '--format=%ae%x00%s%x00%P', c])).trim().split('\0');
+    if (email === SEEN_IDENTITY.GIT_AUTHOR_EMAIL && subject === SEEN_SUBJECT) stack.push(...(parents ?? '').split(' ').filter(Boolean));
+    else out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Tips that count as seen at `address` though the record does not hold them yet. Read-only: the caller
+ * records them. Read before anything moves the tracking ref.
+ * - No record for any repository (the user's own clone, older code, `refs/cob/` removed): every value the
+ *   tracking ref has had (R23).
+ * - A record for this repository: the values the user's own `git fetch` or `git pull` moved the tracking
+ *   ref to, forward from a tip the record holds (R26).
+ * - A record for another repository only: nothing; the tracking ref may hold that repository's history (R15).
  */
 async function seedTips(dir: string, address: string): Promise<string[]> {
-  if ((await revOrNull(dir, seenRef(address))) !== null) return [];
-  const legacy = await revOrNull(dir, legacySeenRef(address));
-  if (legacy !== null) return [legacy];
-  if ((await git(dir, ['for-each-ref', '--count=1', '--format=%(refname)', SEEN_PREFIX])).trim()) return [];
-  const tracking = `refs/remotes/${REMOTE}/${BRANCH}`;
-  const tip = await revOrNull(dir, tracking);
-  if (tip === null) return [];
-  const logged = await git(dir, ['reflog', 'show', '--no-abbrev', '--format=%H', tracking, '--']).then(
-    (s) => s.split('\n').filter((l) => /^[0-9a-f]{40,64}$/.test(l)),
-    () => [] as string[],
-  );
-  const candidates = [...new Set([...logged.reverse(), tip])];
-  const types = await run(dir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input: `${candidates.join('\n')}\n` });
-  const commits = new Set(types.split('\n').filter((l) => l.endsWith(' commit')).map((l) => l.split(' ')[0]!));
-  return candidates.filter((c) => commits.has(c));
+  const record = await revOrNull(dir, seenRef(dir, address));
+  if (record === null) {
+    if ((await git(dir, ['for-each-ref', '--count=1', '--format=%(refname)', SEEN_PREFIX])).trim()) return [];
+    return trackingValues(dir);
+  }
+  const known = await recordTips(dir, record);
+  const out: string[] = [];
+  for (const v of (await trackingValues(dir)).slice(-50)) {
+    if (await isAncestor(dir, v, record)) continue;
+    for (const t of known) {
+      if (await isAncestor(dir, t, v)) {
+        out.push(v);
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 async function revOrNull(dir: string, rev: string): Promise<string | null> {
@@ -1184,7 +1203,7 @@ async function revOrNull(dir: string, rev: string): Promise<string | null> {
 
 /** Add `tip` to what this checkout has seen on `origin/main` at `address`. */
 async function recordSeen(dir: string, address: string, tip: string): Promise<void> {
-  const ref = seenRef(address);
+  const ref = seenRef(dir, address);
   const old = await revOrNull(dir, ref);
   if (old === null) {
     await git(dir, ['update-ref', ref, tip, ZERO_SHA]);
@@ -1198,7 +1217,7 @@ async function recordSeen(dir: string, address: string, tip: string): Promise<vo
   const emptyTree = (await run(dir, ['mktree'], { input: '' })).trim();
   const both = (
     await run(dir, ['commit-tree', emptyTree, '-p', old, '-p', tip, '-F', '-'], {
-      input: 'cob: tips seen on origin/main\n',
+      input: `${SEEN_SUBJECT}\n`,
       env: SEEN_IDENTITY,
     })
   ).trim();
@@ -1224,7 +1243,7 @@ async function integrate(
   const local = (await git(dir, ['rev-parse', 'HEAD'])).trim();
   const upstream = remote.tip;
   if (local === upstream) return 'done';
-  const seen = await revOrNull(dir, seenRef(remote.address));
+  const seen = await revOrNull(dir, seenRef(dir, remote.address));
   const tips = [upstream, ...(seen ? [seen] : [])];
   const listed = await run(dir, ['rev-list', '--reverse', '--first-parent', '--stdin'], {
     input: `${local}\n${tips.map((t) => `^${t}`).join('\n')}\n`,
@@ -1312,7 +1331,9 @@ async function fetchRemote(dir: string): Promise<RemoteState> {
     tip = null;
   }
   if (tip === null) {
-    if (seeds.length > 0 || (await revOrNull(dir, seenRef(address))) !== null) {
+    if (seeds.length > 0 || (await revOrNull(dir, seenRef(dir, address))) !== null) {
+      // Keep what was counted, so the user's own `git fetch --prune` cannot erase it before the next sync (R23).
+      for (const seed of seeds) await recordSeen(dir, address, seed);
       throw new RemoteRefused(
         `The remote's ${BRANCH} branch is gone (it was deleted, or the repo was recreated on the git host), so nothing ` +
           'was synced and nothing was pushed. Your data is still here. To upload it again, set up the remote again.',
