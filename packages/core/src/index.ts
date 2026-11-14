@@ -10,4 +10,20 @@ export * from './process.ts';
 export * from './inbox.ts';
 export * from './copy.ts';
 export * from './init.ts';
-export * from './git.ts';
+export {
+  GitError,
+  HostRewoundError,
+  MIN_GIT_VERSION,
+  SecretLeakError,
+  SyncBusyError,
+  assertNoSecrets,
+  cloneDataRepo,
+  git,
+  initPrivateRepo,
+  pullRepo,
+  syncRepo,
+  type GitIdentity,
+  type PullOptions,
+  type SyncOptions,
+  type SyncResult,
+} from './git.ts';

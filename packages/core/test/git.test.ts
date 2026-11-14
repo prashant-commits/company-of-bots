@@ -7,6 +7,7 @@ import { createCommand, finishCommand, queuedCommands } from '../src/commands.ts
 import { upsertRole } from '../src/applications.ts';
 import {
   GitError,
+  HostRewoundError,
   SecretLeakError,
   SyncBusyError,
   assertNoSecrets,
@@ -15,6 +16,9 @@ import {
   initPrivateRepo,
   pullRepo,
   syncRepo,
+  withTestHooks,
+  type SyncOptions,
+  type SyncResult,
 } from '../src/git.ts';
 import { repositoryKey } from '../src/remote-key.ts';
 import { T1 as T1_ISO, bare, clean, rebaseInProgress, roleInput, sample, tmpDir } from './helpers.ts';
@@ -335,11 +339,10 @@ test('B9 the owner keeps the file when the other side deleted it, in either orde
   clean(agentDir);
 }, T);
 
-test('B11 a SecretLeakError leaves no rebase and no commit', async () => {
+test('B11 a SecretLeakError leaves no commit', async () => {
   write(appDir, 'tmp/session.json', '{"sameSite":"Lax","httpOnly":true}');
   const head = sh(appDir, 'rev-parse', 'HEAD');
   await expect(syncRepo(appDir, 'app', 'oops')).rejects.toBeInstanceOf(SecretLeakError);
-  expect(rebaseInProgress(appDir)).toBe(false);
   expect(sh(appDir, 'rev-parse', 'HEAD')).toBe(head);
 }, T);
 
@@ -394,7 +397,6 @@ test('B13 path patterns are refused, nothing is committed, paths are unstaged bu
   expect(sh(appDir, 'rev-parse', 'HEAD')).toBe(head);
   expect(sh(appDir, 'diff', '--cached', '--name-only')).toBe('');
   for (const p of bad) expect(exists(appDir, p)).toBe(true);
-  expect(rebaseInProgress(appDir)).toBe(false);
 }, T);
 
 test('B13 a Netscape cookie header is refused wherever the file lives and whatever it is called', async () => {
@@ -456,7 +458,7 @@ test('B14 pullRepo resolves conflicts by owner after committing local changes, a
 test('B14 pullRepo with nothing local just pulls', async () => {
   app.put('source', sample.source({ id: 's1' }));
   await syncRepo(appDir, 'app', 'add source');
-  expect(await pullRepo(agentDir, 'agent')).toEqual({ committed: null, pushed: false, resolved: [] });
+  expect(await pullRepo(agentDir, 'agent')).toEqual({ committed: null, pushed: false, resolved: [], rewound: null });
   expect(agent.get('source', 's1')).not.toBeNull();
 }, T);
 
@@ -490,12 +492,12 @@ test('B15 the remote moves between our pull and our push: pull and push are retr
   const mover = remoteMover();
   write(agentDir, 'mine.txt', 'mine\n');
   let once = true;
-  const r = await syncRepo(agentDir, 'agent', 'mine', {
+  const r = await syncRepo(agentDir, 'agent', 'mine', withTestHooks({
     beforePush: async () => {
       if (once) await mover.advance();
       once = false;
     },
-  });
+  }));
   expect(r).toMatchObject({ pushed: true, resolved: [] });
   expect(mover.count()).toBe(1);
   expect(sh(remote, 'rev-parse', 'main')).toBe(sh(agentDir, 'rev-parse', 'HEAD'));
@@ -507,11 +509,10 @@ test('B15 the remote moves between our pull and our push: pull and push are retr
 test('B15 when every attempt is beaten, pushed is false with no error and the commit goes out next time', async () => {
   const mover = remoteMover();
   write(agentDir, 'mine.txt', 'mine\n');
-  const r = await syncRepo(agentDir, 'agent', 'mine', { beforePush: mover.advance });
+  const r = await syncRepo(agentDir, 'agent', 'mine', withTestHooks({ beforePush: mover.advance }));
   expect(r).toMatchObject({ pushed: false, resolved: [] });
   expect(r.committed).toBe(sh(agentDir, 'rev-parse', 'HEAD').trim());
   expect(mover.count()).toBe(3); // default maxAttempts
-  expect(rebaseInProgress(agentDir)).toBe(false);
   expect(await syncRepo(agentDir, 'agent', 'again')).toMatchObject({ committed: null, pushed: true });
   expect(remoteTree()).toContain('mine.txt');
 }, T);
@@ -519,21 +520,19 @@ test('B15 when every attempt is beaten, pushed is false with no error and the co
 test('B15 maxAttempts is honoured', async () => {
   const mover = remoteMover();
   write(agentDir, 'mine.txt', 'mine\n');
-  expect((await syncRepo(agentDir, 'agent', 'mine', { maxAttempts: 1, beforePush: mover.advance })).pushed).toBe(false);
+  expect((await syncRepo(agentDir, 'agent', 'mine', withTestHooks({ beforePush: mover.advance }, { maxAttempts: 1 }))).pushed).toBe(false);
   expect(mover.count()).toBe(1);
-  expect((await syncRepo(agentDir, 'agent', 'mine', { maxAttempts: 5, beforePush: mover.advance })).pushed).toBe(false);
+  expect((await syncRepo(agentDir, 'agent', 'mine', withTestHooks({ beforePush: mover.advance }, { maxAttempts: 5 }))).pushed).toBe(false);
   expect(mover.count()).toBe(6); // 1 earlier + 5 now
 }, T);
 
-test('B16 an unreachable remote is a GitError carrying stderr, with no rebase left', async () => {
+test('B16 an unreachable remote is a GitError carrying stderr', async () => {
   sh(agentDir, 'remote', 'set-url', 'origin', path.join(tmpDir(), 'no-such.git'));
   write(agentDir, 'mine.txt', 'mine\n');
   const err = (await syncRepo(agentDir, 'agent', 'mine').catch((e: unknown) => e)) as GitError;
   expect(err).toBeInstanceOf(GitError);
   expect(err.stderr).toMatch(/does not appear to be a git repository|No such file|not found/i);
-  expect(rebaseInProgress(agentDir)).toBe(false);
   await expect(pullRepo(agentDir, 'agent')).rejects.toBeInstanceOf(GitError);
-  expect(rebaseInProgress(agentDir)).toBe(false);
 }, T);
 
 test('B16 a repo with no origin cannot sync: GitError, but local changes are committed and safe', async () => {
@@ -542,7 +541,6 @@ test('B16 a repo with no origin cannot sync: GitError, but local changes are com
   write(dir, 'notes.txt', 'x\n');
   await expect(syncRepo(dir, 'app', 'save')).rejects.toBeInstanceOf(GitError);
   expect(sh(dir, 'log', '-1', '--format=%s')).toBe('save\n');
-  expect(rebaseInProgress(dir)).toBe(false);
 }, T);
 
 test('B16 a push refused for another reason is a GitError, not a silent pushed:false', async () => {
@@ -551,7 +549,6 @@ test('B16 a push refused for another reason is a GitError, not a silent pushed:f
   const err = (await syncRepo(agentDir, 'agent', 'mine').catch((e: unknown) => e)) as GitError;
   expect(err).toBeInstanceOf(GitError);
   expect(err.stderr).toContain('no thanks');
-  expect(rebaseInProgress(agentDir)).toBe(false);
 }, T);
 
 test('B16 credentials in a remote URL never appear in the error', async () => {
@@ -589,7 +586,6 @@ test('B19 a DataRepo temp file present during a sync is never committed or pushe
   expect(sh(remote, 'log', '--all', '--name-only', '--format=')).not.toMatch(/\.tmp-[0-9a-f]{6}/);
   expect(read(appDir, tmpFile)).toBe('{"half":');
   expect(sh(appDir, 'diff', '--cached', '--name-only')).toBe('');
-  expect(rebaseInProgress(appDir)).toBe(false);
 }, T);
 
 test('B19 a temp file alone is not a change, and pullRepo leaves it untouched too', async () => {
@@ -655,16 +651,16 @@ test('S1 overlapping calls on one checkout run one after another and lose nothin
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
   write(appDir, 'a.txt', 'a1\n');
-  const first = syncRepo(appDir, 'app', 'first', {
+  const first = syncRepo(appDir, 'app', 'first', withTestHooks({
     beforePush: async () => {
       log.push('first-at-push');
       await gate;
       log.push('first-released');
     },
-  });
+  }));
   await waitFor(() => log.includes('first-at-push'));
   write(appDir, 'b.txt', 'b1\n');
-  const second = syncRepo(appDir, 'app', 'second', { beforeIntegrate: async () => void log.push('second-started') });
+  const second = syncRepo(appDir, 'app', 'second', withTestHooks({ beforeIntegrate: async () => void log.push('second-started') }));
   await sleep(400);
   expect(log).not.toContain('second-started');
   release();
@@ -743,13 +739,15 @@ test('S2 a file written while the sync runs is committed now or kept for the nex
   write(agentDir, 'notes.txt', 'agent\n');
   await syncRepo(agentDir, 'agent', 'agent notes');
   write(appDir, 'notes.txt', 'app 1\n');
-  const r = await syncRepo(appDir, 'app', 'app notes', {
+  const r = await syncRepo(
+    appDir,
+    'app',
+    'app notes',
     // The user saves again while the pull is about to change the same file.
-    beforeIntegrate: async () => write(appDir, 'notes.txt', 'app 2 (written mid-sync)\n'),
-  });
+    withTestHooks({ beforeIntegrate: async () => write(appDir, 'notes.txt', 'app 2 (written mid-sync)\n') }),
+  );
   expect(r.pushed).toBe(true);
   expect(read(appDir, 'notes.txt')).toBe('app 2 (written mid-sync)\n');
-  expect(rebaseInProgress(appDir)).toBe(false);
   await syncRepo(appDir, 'app', 'next');
   expect(sh(remote, 'show', 'main:notes.txt')).toBe('app 2 (written mid-sync)\n');
   clean(appDir);
@@ -843,7 +841,6 @@ test('S4 a path-pattern secret committed outside sync is refused too', async () 
   const err = (await syncRepo(appDir, 'app', 'sync').catch((e: unknown) => e)) as SecretLeakError;
   expect(err).toBeInstanceOf(SecretLeakError);
   expect(err.paths).toEqual(['profile/secret.txt']);
-  expect(rebaseInProgress(appDir)).toBe(false);
 }, T);
 
 // --- S5: content guard at any size, UTF-16, byte-exact names ----------------
@@ -980,7 +977,6 @@ test('S9 a file on one side and a folder of the same name on the other: GitError
   const err = (await syncRepo(agentDir, 'agent', 'agent folder').catch((e: unknown) => e)) as GitError;
   expect(err).toBeInstanceOf(GitError);
   expect(err.message).toContain('notes.txt');
-  expect(rebaseInProgress(agentDir)).toBe(false);
   expect(sh(remote, 'rev-parse', 'main')).toBe(remoteHead);
   expect(sh(remote, 'show', 'main:notes.txt')).toBe('app file\n');
   expect(remoteTree()).not.toContain('inside.txt');
@@ -1008,7 +1004,6 @@ test('S9 the other order: the owner’s file stays at its path and the clash is 
   const err = (await syncRepo(appDir, 'app', 'app file').catch((e: unknown) => e)) as GitError;
   expect(err).toBeInstanceOf(GitError);
   expect(err.message).toContain('notes.txt');
-  expect(rebaseInProgress(appDir)).toBe(false);
   expect(read(appDir, 'notes.txt')).toBe('app edit\n');
   expect(remoteTree()).not.toMatch(/notes\.txt~/);
   expect(remoteTree()).toContain('notes.txt/inside.txt');
@@ -1069,15 +1064,13 @@ test('S11 on another branch or a detached HEAD: GitError, nothing pushed, never 
 
 // --- S12: only an exhausted non-fast-forward gives pushed:false ------------------
 
-test('S12 a lock failure on the remote is a GitError after the retries, not pushed:false', async () => {
+test('S12 (replaced by F15) a lock failure on the remote on every retry is pushed: false, not a GitError; the commit goes out next time', async () => {
   fs.writeFileSync(path.join(remote, 'refs/heads/main.lock'), '');
   write(agentDir, 'mine.txt', 'mine\n');
-  const err = (await syncRepo(agentDir, 'agent', 'mine').catch((e: unknown) => e)) as GitError;
-  expect(err).toBeInstanceOf(GitError);
-  expect(err.stderr).toMatch(/lock/);
-  expect(rebaseInProgress(agentDir)).toBe(false);
+  expect(await syncRepo(agentDir, 'agent', 'mine')).toMatchObject({ pushed: false });
   fs.unlinkSync(path.join(remote, 'refs/heads/main.lock'));
   expect((await syncRepo(agentDir, 'agent', 'retry')).pushed).toBe(true);
+  expect(remoteTree()).toContain('mine.txt');
 }, T);
 
 // --- S13: big sets, no contents in errors -------------------------------------
@@ -1167,19 +1160,19 @@ test('S16 a remote that moves before the push is never overwritten, and the non-
   };
   write(agentDir, 'mine.txt', 'mine\n');
   let first = true;
-  const r = await syncRepo(agentDir, 'agent', 'mine', {
+  const r = await syncRepo(agentDir, 'agent', 'mine', withTestHooks({
     beforePush: async () => {
       if (first) await advance();
       first = false;
     },
-  });
+  }));
   expect(r.pushed).toBe(true);
   expect(n).toBe(1);
   expect(sh(remote, 'log', '--format=%s')).toContain('third 1');
   expect(sh(remote, 'log', '--format=%s')).toContain('mine');
   // A beaten last attempt gives pushed:false and the other side's commit is still there.
   write(agentDir, 'mine2.txt', 'mine\n');
-  const r2 = await syncRepo(agentDir, 'agent', 'mine2', { maxAttempts: 1, beforePush: advance });
+  const r2 = await syncRepo(agentDir, 'agent', 'mine2', withTestHooks({ beforePush: advance }, { maxAttempts: 1 }));
   expect(r2.pushed).toBe(false);
   expect(sh(remote, 'log', '--format=%s')).toContain('third 2');
   expect(sh(remote, 'log', '--format=%s')).not.toContain('mine2');
@@ -1352,19 +1345,34 @@ function rewindRemote(): void {
   sh(third, 'push', '-q', '--force', 'origin', 'main');
 }
 
+/**
+ * R53: after a host rewind that drops commits from `dir`'s main, a call is refused first with HostRewoundError
+ * and changes nothing; called again with `acceptRewind`, it follows the remote (R5) and reports the drop.
+ */
+async function followRewind(dir: string, call: (opts?: SyncOptions) => Promise<SyncResult>): Promise<SyncResult> {
+  const state = () => [sh(dir, 'rev-parse', 'HEAD'), sh(dir, 'ls-files', '-s'), sh(dir, 'status', '--porcelain', '-uall')];
+  const before = state();
+  await expect(call()).rejects.toBeInstanceOf(HostRewoundError);
+  expect(state()).toEqual(before);
+  const r = await call({ acceptRewind: true });
+  expect(r.rewound?.dropped).toBeGreaterThan(0);
+  expect(r.rewound?.keptUnder).toMatch(/^refs\/cob\/seen\//);
+  return r;
+}
+
 test('R5 a commit removed on the git host is not pushed back, with or without new local commits', async () => {
   write(appDir, 'notes/transcript.txt', 'private\n');
   await syncRepo(appDir, 'app', 'transcript');
   await pullRepo(agentDir, 'agent');
   rewindRemote();
-  // Nothing new on the agent: it follows the remote.
-  expect(await syncRepo(agentDir, 'agent', 'noop')).toMatchObject({ committed: null, pushed: true });
+  // Nothing new on the agent: it follows the remote once the rewind is accepted (R53).
+  expect(await followRewind(agentDir, (o) => syncRepo(agentDir, 'agent', 'noop', o))).toMatchObject({ committed: null, pushed: true });
   expect(remoteHistory()).not.toContain('transcript');
   expect(exists(agentDir, 'notes/transcript.txt')).toBe(false);
   expect(sh(agentDir, 'rev-parse', 'HEAD')).toBe(sh(remote, 'rev-parse', 'main'));
   // A new local commit on the app, which still has the removed commit: only the new commit goes out.
   write(appDir, 'new.txt', 'new\n');
-  const r = await syncRepo(appDir, 'app', 'new');
+  const r = await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'new', o));
   expect(r.pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   expect(remoteTree()).toContain('new.txt');
@@ -1377,7 +1385,7 @@ test('R5 pullRepo follows the rewrite too', async () => {
   await syncRepo(appDir, 'app', 'transcript');
   await pullRepo(agentDir, 'agent');
   rewindRemote();
-  await pullRepo(agentDir, 'agent');
+  await followRewind(agentDir, (o) => pullRepo(agentDir, 'agent', o));
   expect(sh(agentDir, 'rev-parse', 'HEAD')).toBe(sh(remote, 'rev-parse', 'main'));
   expect(exists(agentDir, 'notes/transcript.txt')).toBe(false);
 }, T);
@@ -1387,7 +1395,7 @@ test('R5 a scrubbed cookie commit does not block the other checkout', async () =
   await pullRepo(agentDir, 'agent');
   rewindRemote();
   write(agentDir, 'work.txt', 'agent work\n');
-  expect((await syncRepo(agentDir, 'agent', 'work')).pushed).toBe(true);
+  expect((await followRewind(agentDir, (o) => syncRepo(agentDir, 'agent', 'work', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('tmp/s.json');
   expect(remoteTree()).toContain('work.txt');
 }, T);
@@ -1402,12 +1410,12 @@ test('R6 a file deleted mid-sync that the incoming change touches stays deleted,
   await syncRepo(agentDir, 'agent', 'agent edit');
   write(appDir, 'other.txt', 'x\n');
   let once = true;
-  const r = await syncRepo(appDir, 'app', 'app', {
+  const r = await syncRepo(appDir, 'app', 'app', withTestHooks({
     beforeIntegrate: async () => {
       if (once) fs.unlinkSync(path.join(appDir, 'notes.txt'));
       once = false;
     },
-  });
+  }));
   expect(r).toMatchObject({ pushed: true, resolved: ['notes.txt'] }); // the app owns it: its delete wins
   expect(exists(appDir, 'notes.txt')).toBe(false);
   expect(remoteTree()).not.toMatch(/^notes\.txt$/m);
@@ -1421,14 +1429,14 @@ test('R8 a file rewritten with identical bytes mid-sync is not an error', async 
   write(agentDir, 'notes.txt', 'agent edit\n');
   await syncRepo(agentDir, 'agent', 'agent edit');
   write(appDir, 'other.txt', 'x\n');
-  const r = await syncRepo(appDir, 'app', 'app', {
+  const r = await syncRepo(appDir, 'app', 'app', withTestHooks({
     beforeIntegrate: async () => {
       const file = path.join(appDir, 'notes.txt');
       const body = fs.readFileSync(file);
       fs.unlinkSync(file); // a new inode and new times, same bytes
       fs.writeFileSync(file, body);
     },
-  });
+  }));
   expect(r.pushed).toBe(true);
   expect(read(appDir, 'notes.txt')).toBe('agent edit\n');
   clean(appDir);
@@ -1466,15 +1474,15 @@ test('R7 two copies of the module in one process run calls on one checkout one a
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
   write(appDir, 'a.txt', 'a\n');
-  const first = syncRepo(appDir, 'app', 'first', {
+  const first = syncRepo(appDir, 'app', 'first', withTestHooks({
     beforePush: async () => {
       log.push('first-at-push');
       await gate;
     },
-  });
+  }));
   await waitFor(() => log.includes('first-at-push'));
   write(appDir, 'b.txt', 'b\n');
-  const second = copy.syncRepo(appDir, 'app', 'second', { beforeIntegrate: async () => void log.push('second-started') });
+  const second = copy.syncRepo(appDir, 'app', 'second', withTestHooks({ beforeIntegrate: async () => void log.push('second-started') }));
   await sleep(300);
   expect(log).not.toContain('second-started');
   release();
@@ -1529,12 +1537,12 @@ test('R10 a file the incoming change touches, written mid-sync, makes the sync c
   write(agentDir, 'x.txt', 'agent\n');
   await syncRepo(agentDir, 'agent', 'agent x');
   let calls = 0;
-  const r = await syncRepo(appDir, 'app', 'app x', {
+  const r = await syncRepo(appDir, 'app', 'app x', withTestHooks({
     beforeIntegrate: async () => {
       calls++;
       if (calls === 1) write(appDir, 'x.txt', 'app, written mid-sync\n');
     },
-  });
+  }));
   expect(calls).toBe(2); // busy once, then committed and integrated again
   expect(r).toMatchObject({ pushed: true, resolved: ['x.txt'] });
   expect(remoteFile('x.txt')).toBe('app, written mid-sync\n');
@@ -1935,9 +1943,10 @@ test('R19 with the reflog gone and the first sync after the rewrite stopped part
   fs.rmSync(path.join(agentDir, '.git', 'logs'), { recursive: true, force: true });
   sh(agentDir, 'config', 'core.logAllRefUpdates', 'false');
   const stop = new Error('killed between fetch and moving main');
-  await expect(syncRepo(agentDir, 'agent', 'x', { beforeIntegrate: async () => Promise.reject(stop) })).rejects.toBe(stop);
+  const accept = withTestHooks({ beforeIntegrate: async () => Promise.reject(stop) }, { acceptRewind: true });
+  await expect(syncRepo(agentDir, 'agent', 'x', accept)).rejects.toBe(stop);
   expect(exists(agentDir, 'notes/transcript.txt')).toBe(true); // main has not moved yet
-  expect((await syncRepo(agentDir, 'agent', 'again')).pushed).toBe(true);
+  expect((await followRewind(agentDir, (o) => syncRepo(agentDir, 'agent', 'again', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   expect(exists(agentDir, 'notes/transcript.txt')).toBe(false);
 }, T);
@@ -1948,7 +1957,7 @@ test('R19 with .git/logs removed (no stop), the rewrite is still followed', asyn
   rewindRemote();
   fs.rmSync(path.join(appDir, '.git', 'logs'), { recursive: true, force: true });
   write(appDir, 'new.txt', 'new\n');
-  expect((await syncRepo(appDir, 'app', 'new')).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'new', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   expect(remoteTree()).toContain('new.txt');
 }, T);
@@ -1960,7 +1969,7 @@ test('R20 commits a host restore dropped stay reachable under refs/cob/ through 
   await pullRepo(agentDir, 'agent');
   rewindRemote(); // the host is restored from a backup taken before that push
   for (const dir of [agentDir, appDir]) {
-    await syncRepo(dir, dir === appDir ? 'app' : 'agent', 'follow');
+    await followRewind(dir, (o) => syncRepo(dir, dir === appDir ? 'app' : 'agent', 'follow', o));
     expect(exists(dir, 'notes/lost.txt')).toBe(false);
     sh(dir, 'reflog', 'expire', '--expire=now', '--all');
     sh(dir, 'gc', '-q', '--prune=now');
@@ -2010,7 +2019,7 @@ test('R23 no record, reflog intact: a host rewind is followed and the dropped co
   await syncRepo(appDir, 'app', 'transcript');
   removeRecords(appDir);
   rewindRemote();
-  expect((await syncRepo(appDir, 'app', 'sync')).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'sync', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   expect(sh(remote, 'log', '--format=%s', 'main')).not.toContain('transcript');
   expect(exists(appDir, 'notes/transcript.txt')).toBe(false);
@@ -2030,7 +2039,7 @@ test('R23 no record and no reflog: the tracking tip alone is enough, for a rewin
   removeRecords(appDir);
   fs.rmSync(path.join(appDir, '.git', 'logs'), { recursive: true, force: true });
   rewindRemote();
-  expect((await syncRepo(appDir, 'app', 'sync')).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'sync', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   removeRecords(appDir);
   fs.rmSync(path.join(appDir, '.git', 'logs'), { recursive: true, force: true });
@@ -2047,7 +2056,7 @@ test('R23 a checkout made by the user’s own `git clone` follows a host rewind'
   sh(own, 'config', 'user.email', 'own@example.com');
   rewindRemote();
   write(own, 'work.txt', 'work\n');
-  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  expect((await followRewind(own, (o) => syncRepo(own, 'agent', 'work', o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain('transcript');
   expect(remoteTree()).toContain('work.txt');
 }, T);
@@ -2129,7 +2138,7 @@ async function scrubAfterRespelling(spelling: string, n: number): Promise<void> 
   await syncRepo(appDir, 'app', `transcript ${n}`);
   sh(appDir, 'remote', 'set-url', 'origin', spelling);
   rewindRemote();
-  expect((await syncRepo(appDir, 'app', `after ${n}`)).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', `after ${n}`, o))).pushed).toBe(true);
   expect(remoteHistory()).not.toContain(`transcript-${n}`);
 }
 
@@ -2210,7 +2219,7 @@ test('R22 a host rewrite that removes a commit from the middle keeps every old t
   sh(third, 'rebase', '-q', '--onto', `${leak}^`, leak, 'main');
   sh(third, 'push', '-q', '--force', 'origin', 'main');
   for (const [dir, writer] of [[agentDir, 'agent'], [appDir, 'app']] as const) {
-    expect((await syncRepo(dir, writer, 'follow')).pushed).toBe(true);
+    expect((await followRewind(dir, (o) => syncRepo(dir, writer, 'follow', o))).pushed).toBe(true);
     expect(exists(dir, 'notes/leak.txt')).toBe(false);
     expect(exists(dir, 'later.txt')).toBe(true);
     sh(dir, 'reflog', 'expire', '--expire=now', '--all');
@@ -2240,7 +2249,7 @@ const scrubHeld = () => {
 test('R25 `file://localhost` plus the absolute path is the same repository: a scrub stays scrubbed', async () => {
   await pushThenScrub(appDir, 'app');
   sh(appDir, 'remote', 'set-url', 'origin', `file://localhost${remote}`);
-  expect((await syncRepo(appDir, 'app', 'after')).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'after', o))).pushed).toBe(true);
   scrubHeld();
 }, T);
 
@@ -2249,7 +2258,7 @@ test('R25 a relative path is resolved against the checkout, not the process fold
   const relative = path.relative(appDir, remote);
   expect(path.relative(process.cwd(), remote)).not.toBe(relative); // the two folders differ
   sh(appDir, 'remote', 'set-url', 'origin', relative);
-  expect((await syncRepo(appDir, 'app', 'after')).pushed).toBe(true);
+  expect((await followRewind(appDir, (o) => syncRepo(appDir, 'app', 'after', o))).pushed).toBe(true);
   scrubHeld();
 }, T);
 
@@ -2288,7 +2297,7 @@ test('R23 a plain clone’s starting tip counts after the user’s own fetch mov
   sh(own, 'fetch', '-q', 'origin'); // the user's own fetch: the clone tip is now only an old value in the log
   expect(exists(own, 'notes/transcript.txt')).toBe(true);
   write(own, 'work.txt', 'work\n');
-  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  expect((await followRewind(own, (o) => syncRepo(own, 'agent', 'work', o))).pushed).toBe(true);
   scrubHeld();
   expect(exists(own, 'notes/transcript.txt')).toBe(false);
 }, T);
@@ -2319,7 +2328,7 @@ test('R26 a commit the user’s own `git pull` brought in, then dropped on the h
   sh(agentDir, 'pull', '-q', '--no-rebase', 'origin', 'main'); // by hand: core never saw this tip
   rewindRemote();
   write(agentDir, 'work.txt', 'work\n');
-  expect((await syncRepo(agentDir, 'agent', 'work')).pushed).toBe(true);
+  expect((await followRewind(agentDir, (o) => syncRepo(agentDir, 'agent', 'work', o))).pushed).toBe(true);
   scrubHeld();
   expect(remoteTree()).toContain('work.txt');
 }, T);
@@ -2347,7 +2356,7 @@ test('R22 seeding reads the reflog: a commit the user pulled, then the host drop
   rewindRemote();
   sh(own, 'fetch', '-q', 'origin'); // the tracking ref no longer holds it
   write(own, 'work.txt', 'work\n');
-  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  expect((await followRewind(own, (o) => syncRepo(own, 'agent', 'work', o))).pushed).toBe(true);
   scrubHeld();
 }, T);
 

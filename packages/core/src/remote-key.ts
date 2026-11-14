@@ -1,6 +1,6 @@
 // Internal to git.ts (not exported from the package): which repository a remote address names.
-import fs from 'node:fs';
 import path from 'node:path';
+import { realPath } from './repo-paths.ts';
 
 type PathApi = typeof path.posix;
 
@@ -14,12 +14,15 @@ export type KeyOptions = {
 /**
  * Where git finds a local repository given as `abs`: the path itself, or else `abs.git`, with symlinks
  * resolved and a trailing `/.git` folded into its working tree. A path that does not exist is kept as written.
+ * Resolved with the OS's resolver (lane A's), so a lower-case drive letter or an 8.3 short name on Windows, or
+ * another letter case on macOS, gives the canonical spelling git uses.
  */
-export function locateLocal(abs: string): string {
+export function locateLocal(abs: string, resolve: (p: string) => string = realPath): string {
+  const api = /^[A-Za-z]:[\\/]|^\\\\/.test(abs) ? path.win32 : path;
   for (const candidate of [abs, `${abs}.git`]) {
     try {
-      const real = fs.realpathSync(candidate);
-      return path.basename(real) === '.git' ? path.dirname(real) : real;
+      const real = resolve(candidate);
+      return api.basename(real) === '.git' ? api.dirname(real) : real;
     } catch {
       // try the next spelling
     }

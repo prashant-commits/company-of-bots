@@ -5,7 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { initDataLayout } from './init.ts';
 import { ownerOfPath, type Writer } from './layout.ts';
+import { isOsJunk, isSecretLookingPath, isTmpArtifactName } from './names.ts';
 import { repositoryKey } from './remote-key.ts';
+import { realPath } from './repo-paths.ts';
+import { RepoMetaSchema, SCHEMA_VERSION } from './schema.ts';
 
 export type GitIdentity = { name: string; email: string };
 
@@ -16,17 +19,48 @@ export type SyncResult = {
   pushed: boolean;
   /** Paths settled by the owner-wins rule, each once, sorted. */
   resolved: string[];
+  /**
+   * Set only when the call followed a host rewind it was allowed to follow (`acceptRewind`) and that dropped
+   * commits from local `main`: how many, and the local ref that keeps them reachable (never pushed). Otherwise null.
+   */
+  rewound: { dropped: number; keptUnder: string } | null;
 };
 
-/** Options of `syncRepo` / `pullRepo`. `beforePush` and `beforeIntegrate` are internal and test-only. */
-export type SyncOptions = {
+/** Options of `pullRepo`. */
+export type PullOptions = {
+  /**
+   * Follow the remote when the git host's `main` went back and local `main` would lose commits that were once
+   * on it (R5). Without it the call throws `HostRewoundError` and changes nothing (R53).
+   */
+  acceptRewind?: boolean;
+};
+
+/** Options of `syncRepo`. */
+export type SyncOptions = PullOptions & {
   /** Pull-and-push attempts when the remote moves under us (default 3). */
   maxAttempts?: number;
-  /** INTERNAL, TEST-ONLY: runs right before each push (the remote can be moved here). */
+};
+
+/** The oldest git this code runs on: `git log --diff-merges=first-parent` (the push guard) needs 2.31. */
+export const MIN_GIT_VERSION = '2.31.0';
+
+/** Hooks the tests use to step into a call. Not part of any exported type, and not exported from the package. */
+type TestHooks = {
+  /** Runs right before each push (the remote can be moved here). */
   beforePush?: () => Promise<void>;
-  /** INTERNAL, TEST-ONLY: runs after the fetch, right before the pulled changes are applied. */
+  /** Runs after the fetch, right before the pulled changes are applied. */
   beforeIntegrate?: () => Promise<void>;
 };
+const TEST_HOOKS = Symbol.for('company-of-bots.core.git.test-hooks.v1');
+
+/** INTERNAL, TEST-ONLY (not exported from the package): a copy of `opts` that also runs `hooks`. */
+export function withTestHooks(hooks: TestHooks, opts: SyncOptions = {}): SyncOptions {
+  return Object.assign({ ...opts }, { [TEST_HOOKS]: hooks });
+}
+
+function hooksOf(opts: PullOptions): TestHooks {
+  return (opts as Record<symbol, TestHooks | undefined>)[TEST_HOOKS] ?? {};
+}
 
 const BRANCH = 'main';
 const REMOTE = 'origin';
@@ -113,6 +147,29 @@ export class SecretLeakError extends Error {
   }
 }
 
+/**
+ * The git host's `main` went back (a restore from backup, a scrub by reset, a force-push), so following it
+ * would drop commits from local `main` that were once on the host. Nothing was changed: HEAD, `main`, the
+ * index, the files and the remote are as they were. The agent stops its run and asks the user; the call is
+ * repeated with `acceptRewind: true` once the user agrees. The commits stay reachable under `keptUnder`.
+ */
+export class HostRewoundError extends GitError {
+  readonly dropped: number;
+  readonly keptUnder: string;
+
+  constructor(dropped: number, keptUnder: string) {
+    super(
+      `The git host's ${BRANCH} branch went back: ${dropped} commit${dropped === 1 ? '' : 's'} this data repo has, ` +
+        'which were on the host before, are no longer there (it was restored from a backup, reset, or force-pushed). ' +
+        'Nothing was synced and nothing was changed. If the host was rolled back on purpose, sync again and accept ' +
+        `the rollback; the dropped commits stay kept in this folder under ${keptUnder}.`,
+    );
+    this.name = 'HostRewoundError';
+    this.dropped = dropped;
+    this.keptUnder = keptUnder;
+  }
+}
+
 /** Another process is syncing this checkout right now. Nothing was touched; try again shortly. */
 export class SyncBusyError extends Error {
   constructor(message = 'Another sync is already running on this data repo. Try again in a moment.') {
@@ -121,9 +178,23 @@ export class SyncBusyError extends Error {
   }
 }
 
-/** Hide credentials in URLs: everything between `://` and the last `@` before the host. */
+/**
+ * Hide credentials in remote addresses. In a URL: everything between `://` and the last `@` in it (so a password
+ * holding `/` or `@`, and a token in a path segment before an `@`, go too), and the whole query string
+ * (`?access_token=…`). In an scp-like address: a `user:password@` before `host:`. Anywhere: a token in a
+ * format the big git hosts use (`ghp_…`, `github_pat_…`, `glpat-…`), as some put one in a path segment.
+ */
 function redact(text: string): string {
-  return text.replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/]*@/g, '$1***@');
+  return text
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|dt|ptt|rt|oas)-[A-Za-z0-9_-]{8,})/g, '***')
+    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s'"<>]*)/g, (_m, scheme: string, rest: string) => {
+      const at = rest.lastIndexOf('@');
+      let r = at < 0 ? rest : `***@${rest.slice(at + 1)}`;
+      const q = r.indexOf('?');
+      if (q >= 0) r = `${r.slice(0, q)}?***`;
+      return scheme + r;
+    })
+    .replace(/(^|[\s'"(=])[^\s'"@/:]+:[^\s'"@]*@(?=[^\s'"@/:]+:)/g, '$1***@');
 }
 
 function failure(args: string[], err: unknown, stderrText: string): GitError {
@@ -220,7 +291,6 @@ function parseRaw(out: string): RawEntry[] {
 // Secret guard
 // ---------------------------------------------------------------------------
 
-const SECRET_PATH = /(^|\/)(cookies?|secrets?)(\/|\.|$)|\.cookies?\.json$|storage-state|wake[-_]?token|(^|\/)\.env/i;
 const NETSCAPE = '# Netscape HTTP Cookie File';
 
 /** Finds the cookie needles in a stream of text pieces, including a needle split across two pieces. */
@@ -414,7 +484,7 @@ type BlobRef = { path: string; sha: string };
 
 /** Paths (as byte strings) that look like secrets by name or by content. Deletions never come in here. */
 function secretPaths(dir: string, blobs: BlobRef[]): string[] {
-  const byName = new Set(blobs.filter((b) => SECRET_PATH.test(b.path)).map((b) => b.path));
+  const byName = new Set(blobs.filter((b) => isSecretLookingPath(b.path)).map((b) => b.path));
   const rest = blobs.filter((b) => !byName.has(b.path));
   const hitShas = scanBlobs(dir, rest.map((b) => b.sha));
   const hits = new Set(byName);
@@ -485,6 +555,51 @@ function assertIdentity(identity: GitIdentity): void {
   }
 }
 
+/** The git found on PATH, checked once per PATH: older than `MIN_GIT_VERSION` is a `GitError` before anything runs. */
+const versionChecks = new Map<string, Promise<void>>();
+
+function olderThan(a: number[], b: number[]): boolean {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) < (b[i] ?? 0);
+  }
+  return false;
+}
+
+async function checkGitVersion(): Promise<void> {
+  let out: string;
+  try {
+    out = await new Promise<string>((resolve, reject) =>
+      execFile('git', ['--version'], { env: childEnv(), timeout: COMMAND_TIMEOUT_MS }, (err, stdout) =>
+        err ? reject(err) : resolve(String(stdout)),
+      ),
+    );
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    throw new GitError(
+      code === 'ENOENT'
+        ? `git was not found. Install git ${MIN_GIT_VERSION} or newer; nothing was changed.`
+        : `git could not be run to check its version; nothing was changed.`,
+    );
+  }
+  const m = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(out);
+  const found = m ? `${m[1]}.${m[2]}.${m[3] ?? '0'}` : out.trim() || 'of an unknown version';
+  const toNumbers = (v: string) => v.split('.').map(Number);
+  if (!m || olderThan(toNumbers(found), toNumbers(MIN_GIT_VERSION))) {
+    throw new GitError(`git ${found} was found, but this app needs git ${MIN_GIT_VERSION} or newer. Update git; nothing was changed.`);
+  }
+}
+
+function assertGitVersion(): Promise<void> {
+  const key = process.env.PATH ?? '';
+  let check = versionChecks.get(key);
+  if (!check) {
+    check = checkGitVersion();
+    versionChecks.set(key, check);
+    check.catch(() => versionChecks.delete(key)); // a refused git is checked again next time (it may be updated)
+  }
+  return check;
+}
+
 function assertRemoteString(remote: string): void {
   if (remote.startsWith('-')) throw new GitError('That remote address is not valid: it starts with a dash.');
 }
@@ -503,9 +618,17 @@ function absoluteIfLocal(remote: string): string {
   return fs.existsSync(path.resolve(remote)) ? path.resolve(remote) : remote;
 }
 
+/**
+ * Whether two spellings name one folder, compared through the OS's resolver (as lane A's path layer does), so a
+ * lower-case drive letter, an 8.3 short name or another letter case is the same folder as git's canonical path.
+ */
+export function sameFolder(a: string, b: string, resolve: (p: string) => string = realPath): boolean {
+  return resolve(a) === resolve(b);
+}
+
 async function assertTopLevel(dir: string): Promise<void> {
   const top = (await git(dir, ['rev-parse', '--show-toplevel'])).trim();
-  if (fs.realpathSync(top) !== fs.realpathSync(dir)) {
+  if (!sameFolder(top, dir)) {
     throw new GitError(`${dir} is not the top folder of its own git repository (it sits inside ${top}); nothing was changed.`);
   }
 }
@@ -608,7 +731,7 @@ async function inspectInitTarget(dir: string): Promise<InitTarget> {
   if (!entries.includes('.git')) return { kind: entries.length === 0 ? 'fresh' : 'not-empty' };
   let isRepo = false;
   try {
-    isRepo = fs.realpathSync((await git(dir, ['rev-parse', '--show-toplevel'])).trim()) === fs.realpathSync(dir);
+    isRepo = sameFolder((await git(dir, ['rev-parse', '--show-toplevel'])).trim(), dir);
   } catch {
     isRepo = false;
   }
@@ -629,7 +752,7 @@ async function inspectInitTarget(dir: string): Promise<InitTarget> {
   if (marker.commit === null) {
     if (head !== null) return { kind: 'foreign' };
     const layout = layoutFiles(gitDir);
-    const present = splitZ(await run(dir, ['ls-files', '-o', '-z'], { latin1: true })).filter((p) => !TEMP_FILE.test(p));
+    const present = splitZ(await run(dir, ['ls-files', '-o', '-z'], { latin1: true })).filter((p) => !isTmpArtifactName(p));
     for (const p of present) {
       const expected = layout.get(display(p));
       if (expected === undefined || !keepableLayoutFile(absPath(dir, p).toString(), expected)) return { kind: 'resume-blocked', path: display(p) };
@@ -679,6 +802,7 @@ const REMOTE_HAS_MAIN = `The remote already has a ${BRANCH} branch that is not t
 export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity; remote?: string }): Promise<void> {
   assertIdentity(opts.identity);
   if (opts.remote !== undefined) assertRemoteString(opts.remote);
+  await assertGitVersion();
   const remote = opts.remote === undefined ? undefined : absoluteIfLocal(opts.remote);
 
   const target = await inspectInitTarget(dir);
@@ -742,14 +866,68 @@ export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity
   await recordSeen(dir, address, (await git(dir, ['rev-parse', 'HEAD'])).trim());
 }
 
-/** Clone the user's data repo into `dir` (which must not exist or must be empty, as for `git clone`). */
+/** The sha of the `cob.json` blob at `rev`, or null when `rev` has none, or has one that is not a plain file. */
+async function cobJsonBlob(dir: string, rev: string): Promise<string | null> {
+  const out = await git(dir, ['ls-tree', '-z', rev, '--', 'cob.json']).catch(() => '');
+  const m = /^(100644|100755) blob ([0-9a-f]+)\tcob\.json\0?$/.exec(out);
+  return m ? m[2]! : null;
+}
+
+const NOT_A_DATA_REPO =
+  'It is not a Company of Bots data repo (its main branch has no cob.json), so nothing was synced and nothing ' +
+  'was changed. Check that this is the address of your private data repo, not of the app’s code.';
+const UNREADABLE_COB_JSON = 'Its cob.json cannot be read, so it is not a data repo this app can open. Nothing was changed.';
+
+/** Refuse `rev` unless it holds a `cob.json` of the format version this app reads (the rule `DataRepo` applies). */
+async function assertDataRepoAt(dir: string, rev: string): Promise<void> {
+  const blob = await cobJsonBlob(dir, rev);
+  if (blob === null) throw new GitError(NOT_A_DATA_REPO);
+  let parsed: unknown;
+  try {
+    const text = await git(dir, ['cat-file', 'blob', blob]);
+    parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  } catch {
+    throw new GitError(UNREADABLE_COB_JSON);
+  }
+  const meta = RepoMetaSchema.safeParse(parsed);
+  if (!meta.success) throw new GitError(UNREADABLE_COB_JSON);
+  if (meta.data.schemaVersion !== SCHEMA_VERSION) {
+    throw new GitError(
+      `This data repo uses format version ${meta.data.schemaVersion}; this app supports version ${SCHEMA_VERSION}. ` +
+        'Update the app. Nothing was changed.',
+    );
+  }
+}
+
+/** Undo a clone: remove the folder, or, when it was there (empty) before the call, only what the clone put in it. */
+function removeClone(target: string, existed: boolean): void {
+  if (!existed) {
+    fs.rmSync(target, { recursive: true, force: true });
+    return;
+  }
+  for (const name of fs.readdirSync(target)) fs.rmSync(path.join(target, name), { recursive: true, force: true });
+}
+
+/**
+ * Clone the user's data repo into `dir` (which must not exist or must be empty, as for `git clone`). A
+ * repository whose `main` has no `cob.json`, or one of another format version, is refused (`GitError`): the
+ * clone is removed, and a folder that was there before the call is left as it was. Nothing is pushed.
+ */
 export async function cloneDataRepo(remote: string, dir: string, identity: GitIdentity): Promise<void> {
   assertIdentity(identity);
   assertRemoteString(remote);
+  await assertGitVersion();
   const target = path.resolve(dir);
+  const existed = fs.existsSync(target);
   const config = BYTE_EXACT_CONFIG.flatMap(([key, value]) => ['--config', `${key}=${value}`]);
   await git(process.cwd(), ['clone', '-q', ...config, '--branch', BRANCH, '--', remote, target]);
-  await assertTopLevel(target);
+  try {
+    await assertTopLevel(target);
+    await assertDataRepoAt(target, 'HEAD');
+  } catch (err) {
+    removeClone(target, existed);
+    throw err;
+  }
   await setIdentity(target, identity);
   const tip = (await git(target, ['rev-parse', '--verify', '-q', `refs/remotes/${REMOTE}/${BRANCH}`]).catch(() => '')).trim();
   if (tip) await recordSeen(target, await originAddress(target), tip);
@@ -799,16 +977,25 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/** The lock file's text, or null when there is none. */
+function readLock(file: string): string | null {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 /**
- * A lock is stale when its holder process is gone or it is older than 10 minutes. A lock written by this
- * process is live exactly while some acquisition in this process (any copy of the module) holds its token.
+ * A lock (whose text is `text`) is stale when its holder process is gone or it is older than `maxAge`. A lock
+ * written by this process is live exactly while some acquisition in this process (any copy of the module)
+ * holds its token. Text that is not a lock yet (being written, or damaged) is stale once the file is 5 s old.
  */
-function lockIsStale(file: string): boolean {
+function lockIsStale(file: string, text: string, maxAge = LOCK_STALE_MS): boolean {
   let info: { pid?: unknown; at?: unknown; token?: unknown };
   try {
-    info = JSON.parse(fs.readFileSync(file, 'utf8')) as { pid?: unknown; at?: unknown; token?: unknown };
+    info = JSON.parse(text) as { pid?: unknown; at?: unknown; token?: unknown };
   } catch {
-    // Being written right now, or unreadable: give a writer a moment, then call it stale.
     try {
       return Date.now() - fs.statSync(file).mtimeMs > 5000;
     } catch {
@@ -816,26 +1003,62 @@ function lockIsStale(file: string): boolean {
     }
   }
   if (typeof info.pid !== 'number' || typeof info.at !== 'number') return true;
-  if (Date.now() - info.at > LOCK_STALE_MS) return true;
+  if (Date.now() - info.at > maxAge) return true;
   if (info.pid === process.pid) return typeof info.token !== 'string' || heldLocks.get(file) !== info.token;
   return !processAlive(info.pid);
 }
 
-async function withLock<T>(gitDir: string, fn: () => Promise<T>): Promise<T> {
+/** Create `file` holding `text`, only if it does not exist (atomic). False when it exists. */
+function createExclusive(file: string, text: string): boolean {
+  try {
+    fs.writeFileSync(file, text, { flag: 'wx' });
+    return true;
+  } catch (err) {
+    if ((err as { code?: string }).code === 'EEXIST') return false;
+    throw err;
+  }
+}
+
+/** A takeover holds its guard for a few file operations; one older than this was left by a killed process. */
+const GUARD_STALE_MS = 30 * 1000;
+
+/**
+ * Take over the stale lock whose text is `stale`, or throw `SyncBusyError`. Of the processes that find the same
+ * stale lock at once, exactly one takes it over: only the one that creates the takeover guard (atomically) may
+ * remove the lock, and it does so only while the lock still holds the text it judged stale.
+ */
+function takeOver(file: string, stale: string, mine: string): void {
+  const guard = `${file}.takeover`;
+  const guardText = JSON.stringify({ pid: process.pid, at: Date.now(), token: randomBytes(16).toString('hex') });
+  if (!createExclusive(guard, guardText)) {
+    // Another process is taking over right now. A guard left by a killed takeover is removed for the next call.
+    const left = readLock(guard);
+    if (left !== null && lockIsStale(guard, left, GUARD_STALE_MS) && readLock(guard) === left) fs.rmSync(guard, { force: true });
+    throw new SyncBusyError();
+  }
+  try {
+    if (readLock(file) !== stale) throw new SyncBusyError(); // taken over (and maybe released) by another process meanwhile
+    fs.rmSync(file, { force: true });
+    if (!createExclusive(file, mine)) throw new SyncBusyError(); // a newcomer created it in between: it holds it
+  } finally {
+    fs.rmSync(guard, { force: true });
+  }
+}
+
+/** INTERNAL (not exported from the package): run `fn` holding the cross-process lock of the git dir `gitDir`. */
+export async function withLock<T>(gitDir: string, fn: () => Promise<T>): Promise<T> {
   const file = path.join(gitDir, 'cob-sync.lock');
   const token = randomBytes(16).toString('hex');
-  let acquired = false;
-  for (let attempt = 0; attempt < 3 && !acquired; attempt++) {
-    try {
-      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: Date.now(), token }), { flag: 'wx' });
-      acquired = true;
-    } catch (err) {
-      if ((err as { code?: string }).code !== 'EEXIST') throw err;
-      if (!lockIsStale(file)) throw new SyncBusyError();
-      fs.rmSync(file, { force: true });
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), token });
+  if (!createExclusive(file, mine)) {
+    const found = readLock(file);
+    if (found === null) {
+      if (!createExclusive(file, mine)) throw new SyncBusyError(); // released just now, and taken by another
+    } else {
+      if (!lockIsStale(file, found)) throw new SyncBusyError();
+      takeOver(file, found, mine);
     }
   }
-  if (!acquired) throw new SyncBusyError();
   heldLocks.set(file, token);
   try {
     return await fn();
@@ -907,9 +1130,10 @@ async function assertNoOperation(dir: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function guarded<T>(dir: string, fn: (gitDir: string) => Promise<T>): Promise<T> {
+  await assertGitVersion();
   let key: string;
   try {
-    key = fs.realpathSync(dir);
+    key = realPath(dir);
   } catch (err) {
     throw new GitError(`The data repo folder ${dir} cannot be opened (${(err as { code?: string }).code ?? 'error'}); nothing was synced.`);
   }
@@ -924,6 +1148,9 @@ async function guarded<T>(dir: string, fn: (gitDir: string) => Promise<T>): Prom
           `This data repo is not on the ${BRANCH} branch (${ref ?? 'detached HEAD'}); nothing was synced. Switch back to ${BRANCH}.`,
         );
       }
+      // Every checkout core makes has cob.json from its first commit. Without one this is some other repository
+      // (the app's code, say): syncing would put private records on it (F5).
+      if ((await cobJsonBlob(dir, 'HEAD')) === null) throw new GitError(`${dir}: ${NOT_A_DATA_REPO}`);
       return fn(gitDir);
     });
   });
@@ -933,15 +1160,16 @@ async function guarded<T>(dir: string, fn: (gitDir: string) => Promise<T>): Prom
 // Step 1: commit local changes
 // ---------------------------------------------------------------------------
 
-/** The temp name `DataRepo` writes before renaming: `<file>.tmp-<6 hex>`. Untracked ones are never added. */
-const TEMP_FILE = /\.tmp-[0-9a-f]{6}$/;
-
 type Made = { sha: string };
 
-/** Stage tracked changes, plus untracked files the repo's own .gitignore does not ignore (and no in-flight temp files). */
+/**
+ * Stage tracked changes, plus untracked files the repo's own .gitignore does not ignore. Never added: the temp
+ * files `DataRepo` writes before renaming (`<file>.tmp-<6 hex>`), and the operating system's own files
+ * (`.DS_Store`, `Thumbs.db`, `desktop.ini`).
+ */
 async function stage(dir: string): Promise<void> {
   await git(dir, ['add', '-u']);
-  const fresh = (await untrackedPaths(dir)).filter((p) => !TEMP_FILE.test(p));
+  const fresh = (await untrackedPaths(dir)).filter((p) => !isTmpArtifactName(p) && !isOsJunk(p));
   // update-index (not add) so that ambient excludes, which `git add` consults, cannot refuse a path.
   if (fresh.length > 0) await run(dir, ['update-index', '--add', '-z', '--stdin'], { input: pathInput(fresh) });
 }
@@ -1151,18 +1379,21 @@ async function trackingValues(dir: string): Promise<string[]> {
 
 /** The real tips a record holds: the record itself, or the parents of the commits recordSeen made. */
 async function recordTips(dir: string, record: string): Promise<string[]> {
+  // `recordSeen` makes each of its commits with the old record as first parent and a real tip as second, so the
+  // first-parent line from the record walks every one of them, and ends at the first real tip. One process.
   const out: string[] = [];
-  const stack = [record];
-  const visited = new Set<string>();
-  while (stack.length > 0) {
-    const c = stack.pop()!;
-    if (visited.has(c)) continue;
-    visited.add(c);
-    const [email, subject, parents] = (await git(dir, ['log', '-1', '--format=%ae%x00%s%x00%P', c])).trim().split('\0');
-    if (email === SEEN_IDENTITY.GIT_AUTHOR_EMAIL && subject === SEEN_SUBJECT) stack.push(...(parents ?? '').split(' ').filter(Boolean));
-    else out.push(c);
+  const log = await git(dir, ['log', '--first-parent', '--format=%H%x00%P%x00%ae%x00%s', record]);
+  for (const line of log.split('\n')) {
+    const [c, parents, email, subject] = line.split('\0');
+    if (!c) continue;
+    if (email === SEEN_IDENTITY.GIT_AUTHOR_EMAIL && subject === SEEN_SUBJECT) {
+      out.push(...(parents ?? '').split(' ').filter(Boolean).slice(1));
+    } else {
+      out.push(c);
+      break;
+    }
   }
-  return out;
+  return [...new Set(out)];
 }
 
 /**
@@ -1171,7 +1402,9 @@ async function recordTips(dir: string, record: string): Promise<string[]> {
  * - No record for any repository (the user's own clone, older code, `refs/cob/` removed): every value the
  *   tracking ref has had (R23).
  * - A record for this repository: the values the user's own `git fetch` or `git pull` moved the tracking
- *   ref to, forward from a tip the record holds (R26).
+ *   ref to, forward from a tip the record holds (R26). Every value is looked at, however many moves the
+ *   user's git made since (no window, R50), in a fixed number of git processes: a no-op sync on a checkout with a
+ *   long reflog costs what it costs on a young one.
  * - A record for another repository only: nothing; the tracking ref may hold that repository's history (R15).
  */
 async function seedTips(dir: string, address: string): Promise<string[]> {
@@ -1180,18 +1413,24 @@ async function seedTips(dir: string, address: string): Promise<string[]> {
     if ((await git(dir, ['for-each-ref', '--count=1', '--format=%(refname)', SEEN_PREFIX])).trim()) return [];
     return trackingValues(dir);
   }
-  const known = await recordTips(dir, record);
-  const out: string[] = [];
-  for (const v of (await trackingValues(dir)).slice(-50)) {
-    if (await isAncestor(dir, v, record)) continue;
-    for (const t of known) {
-      if (await isAncestor(dir, t, v)) {
-        out.push(v);
-        break;
-      }
-    }
+  const values = await trackingValues(dir);
+  if (values.length === 0) return [];
+  // The values the record does not hold yet: exactly those among the commits reachable from the values and not
+  // from the record. After core's own fetches only, there are none, and this one walk is all a sync pays.
+  const outside = new Set((await run(dir, ['rev-list', '--stdin'], { input: `${values.join('\n')}\n^${record}\n` })).split('\n'));
+  const candidates = values.filter((v) => outside.has(v));
+  if (candidates.length === 0) return [];
+  // Of those, the ones forward from a tip the record holds: a known tip is among their ancestors. One walk of
+  // their history, children before parents, then settled from the parents up.
+  const known = new Set(await recordTips(dir, record));
+  const walk = await run(dir, ['rev-list', '--topo-order', '--parents', '--stdin'], { input: `${candidates.join('\n')}\n` });
+  const lines = walk.split('\n').filter(Boolean).reverse();
+  const forward = new Set<string>();
+  for (const line of lines) {
+    const [c, ...parents] = line.split(' ');
+    if (parents.some((q) => known.has(q) || forward.has(q))) forward.add(c!);
   }
-  return out;
+  return candidates.filter((v) => forward.has(v));
 }
 
 async function revOrNull(dir: string, rev: string): Promise<string | null> {
@@ -1303,7 +1542,34 @@ async function survivor(dir: string, made: Made, rewrites: Map<string, string | 
   return null;
 }
 
-type Progress = { resolved: Set<string>; rewrites: Map<string, string | null>; made: Made[] };
+type Progress = {
+  resolved: Set<string>;
+  rewrites: Map<string, string | null>;
+  made: Made[];
+  /** Commits an accepted host rewind dropped from local `main`, and the ref that keeps them. */
+  rewound: { dropped: number; keptUnder: string } | null;
+};
+
+const newProgress = (): Progress => ({ resolved: new Set(), rewrites: new Map(), made: [], rewound: null });
+
+/**
+ * How many commits on local `main` (HEAD) were once on `origin/main` at this address (the seen record holds
+ * them) and are not in the remote's history now: what following the remote would drop. Read-only. Zero when
+ * the remote holds HEAD, or when it only lacks commits never pushed (a host rewrite of commits this checkout
+ * never had drops nothing here).
+ */
+async function droppedByRemote(dir: string, remote: { address: string; tip: string }): Promise<number> {
+  const local = (await git(dir, ['rev-parse', 'HEAD'])).trim();
+  if (local === remote.tip) return 0;
+  const ahead = (await run(dir, ['rev-list', '--stdin'], { input: `${local}\n^${remote.tip}\n` })).split('\n').filter(Boolean);
+  if (ahead.length === 0) return 0;
+  const seen = await revOrNull(dir, seenRef(dir, remote.address));
+  if (seen === null) return 0;
+  const neverPushed = (await run(dir, ['rev-list', '--stdin'], { input: `${local}\n^${remote.tip}\n^${seen}\n` }))
+    .split('\n')
+    .filter(Boolean);
+  return ahead.length - neverPushed.length;
+}
 
 /** The remote after a fetch: its address, and its tip, or null when it has no `main` yet (a first push). */
 type RemoteState = { address: string; tip: string | null };
@@ -1357,7 +1623,11 @@ async function fetchRemote(dir: string): Promise<RemoteState> {
   return { address, tip };
 }
 
-/** Fetch, commit what changed, and integrate; repeat if files kept changing under us. */
+/**
+ * Fetch, commit what changed, and integrate; repeat if files kept changing under us. When the remote went back
+ * so that local `main` would lose once-pushed commits, nothing is committed or moved: `HostRewoundError`, unless
+ * `opts.acceptRewind`, in which case the remote is followed (R5) and the drop is counted in `p.rewound`.
+ */
 async function settle(
   dir: string,
   gitDir: string,
@@ -1366,6 +1636,7 @@ async function settle(
   p: Progress,
   opts: SyncOptions,
 ): Promise<RemoteState> {
+  const hooks = hooksOf(opts);
   for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
     let remote: RemoteState;
     try {
@@ -1378,9 +1649,17 @@ async function settle(
       }
       throw err;
     }
+    if (remote.tip !== null) {
+      const dropped = await droppedByRemote(dir, { address: remote.address, tip: remote.tip });
+      if (dropped > 0) {
+        const keptUnder = seenRef(dir, remote.address);
+        if (!opts.acceptRewind) throw new HostRewoundError(dropped, keptUnder);
+        p.rewound = { dropped: (p.rewound?.dropped ?? 0) + dropped, keptUnder };
+      }
+    }
     const made = await stageAndCommit(dir, message);
     if (made) p.made.push(made);
-    await opts.beforeIntegrate?.();
+    await hooks.beforeIntegrate?.();
     if (remote.tip === null) return remote; // nothing on the remote yet: nothing to bring in
     const r = await integrate(dir, gitDir, writer, p.resolved, p.rewrites, { address: remote.address, tip: remote.tip });
     if (r === 'done') return remote;
@@ -1398,33 +1677,41 @@ async function lastSurvivor(dir: string, p: Progress): Promise<string | null> {
 
 const sorted = (set: Set<string>) => [...set].map(display).sort();
 
-/** Commit local changes as `sync: local changes before pull`, then pull with owner-wins conflict resolution. Never pushes. */
-export async function pullRepo(dir: string, writer: Writer, opts: SyncOptions = {}): Promise<SyncResult> {
+/**
+ * Commit local changes as `sync: local changes before pull`, then pull with owner-wins conflict resolution.
+ * Never pushes. A host rewind is `HostRewoundError` unless `opts.acceptRewind` (see `syncRepo`).
+ */
+export async function pullRepo(dir: string, writer: Writer, opts: PullOptions = {}): Promise<SyncResult> {
   return guarded(dir, async (gitDir) => {
-    const p: Progress = { resolved: new Set(), rewrites: new Map(), made: [] };
+    const p = newProgress();
     await settle(dir, gitDir, writer, 'sync: local changes before pull', p, opts);
-    return { committed: await lastSurvivor(dir, p), pushed: false, resolved: sorted(p.resolved) };
+    return { committed: await lastSurvivor(dir, p), pushed: false, resolved: sorted(p.resolved), rewound: p.rewound };
   });
 }
 
 /** A push the remote refused because it moved. */
 const NON_FAST_FORWARD = /\[rejected\]|fetch first/;
-/** A push that lost a race for the ref lock; retried, but an error if it never goes through. */
+/** A push that lost a race for the ref lock: the remote moved, or is moving. Treated like a non-fast-forward. */
 const LOCK_RACE = /cannot lock ref|failed to update ref/;
 
 /**
  * Commit local changes with `message`, pull with owner-wins conflict resolution, and push.
- * When the remote moves between pull and push, pull and push again, up to `maxAttempts` times;
- * then give up with `pushed: false` (the commit stays local and goes out on the next sync).
- * Any other push failure is a `GitError`. A remote with no `main` gets a first push only if this
- * checkout never had `main` from that address (R2, R17).
+ * When the remote moves between pull and push (a non-fast-forward, or a lost race for the ref lock), pull and
+ * push again, up to `maxAttempts` times; then give up with `pushed: false` (the commit stays local and goes out
+ * on the next sync). Any other push failure is a `GitError`. A remote with no `main` gets a first push only if
+ * this checkout never had `main` from that address (R2, R17).
+ *
+ * When the git host's `main` went back, so that local `main` would lose commits that were once on it (a restore,
+ * a scrub by reset, a force-push), the call throws `HostRewoundError` and changes nothing (R53). Called again with
+ * `acceptRewind: true`, it follows the remote: the dropped commits stay reachable under `refs/cob/seen/…`, and
+ * `rewound` reports how many there were and that ref (R5, R20).
  */
 export async function syncRepo(dir: string, writer: Writer, message: string, opts: SyncOptions = {}): Promise<SyncResult> {
   const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? DEFAULT_ATTEMPTS));
+  const hooks = hooksOf(opts);
   return guarded(dir, async (gitDir) => {
-    const p: Progress = { resolved: new Set(), rewrites: new Map(), made: [] };
+    const p = newProgress();
     let pushed = false;
-    let lastRace: GitError | null = null;
     for (let attempt = 1; attempt <= maxAttempts && !pushed; attempt++) {
       const remote = await settle(dir, gitDir, writer, message, p, opts);
       const head = (await git(dir, ['rev-parse', 'HEAD'])).trim();
@@ -1433,19 +1720,15 @@ export async function syncRepo(dir: string, writer: Writer, message: string, opt
         break;
       }
       assertUnpushedClean(dir, remote.tip);
-      await opts.beforePush?.();
+      await hooks.beforePush?.();
       try {
         await git(dir, ['push', ...(remote.tip === null ? ['-u'] : []), REMOTE, `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]);
         pushed = true;
         await recordSeen(dir, remote.address, head);
       } catch (err) {
-        if (!(err instanceof GitError)) throw err;
-        if (NON_FAST_FORWARD.test(err.stderr)) lastRace = null;
-        else if (LOCK_RACE.test(err.stderr)) lastRace = err;
-        else throw err;
+        if (!(err instanceof GitError) || !(NON_FAST_FORWARD.test(err.stderr) || LOCK_RACE.test(err.stderr))) throw err;
       }
     }
-    if (!pushed && lastRace) throw lastRace;
-    return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved) };
+    return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved), rewound: p.rewound };
   });
 }
