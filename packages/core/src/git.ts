@@ -30,9 +30,16 @@ export type SyncResult = {
 export type PullOptions = {
   /**
    * Follow the remote when the git host's `main` went back and local `main` would lose commits that were once
-   * on it (R5). Without it the call throws `HostRewoundError` and changes nothing (R53).
+   * on it (R5). Without it (or `restoreHost`) the call throws `HostRewoundError` and changes nothing (R53).
    */
   acceptRewind?: boolean;
+  /**
+   * The other answer to `HostRewoundError`: the rollback was a mistake. When the host's tip is an ancestor of
+   * local `main`, local `main` is pushed back to the host as a fast-forward (never forced; the secret guard
+   * runs as on every push), `pullRepo` included. When the host's history was rewritten instead, `GitError`,
+   * and nothing changes. Not together with `acceptRewind`.
+   */
+  restoreHost?: boolean;
 };
 
 /** Options of `syncRepo`. */
@@ -40,6 +47,10 @@ export type SyncOptions = PullOptions & {
   /** Pull-and-push attempts when the remote moves under us (default 3). */
   maxAttempts?: number;
 };
+
+const REWIND_ANSWERS =
+  'If the host was rolled back on purpose, sync again accepting the rollback (acceptRewind). If it was a mistake, ' +
+  'sync again restoring the host (restoreHost): this puts the commits back on the host.';
 
 /** The oldest git this code runs on: `git log --diff-merges=first-parent` (the push guard) needs 2.31. */
 export const MIN_GIT_VERSION = '2.31.0';
@@ -161,8 +172,8 @@ export class HostRewoundError extends GitError {
     super(
       `The git host's ${BRANCH} branch went back: ${dropped} commit${dropped === 1 ? '' : 's'} this data repo has, ` +
         'which were on the host before, are no longer there (it was restored from a backup, reset, or force-pushed). ' +
-        'Nothing was synced and nothing was changed. If the host was rolled back on purpose, sync again and accept ' +
-        `the rollback; the dropped commits stay kept in this folder under ${keptUnder}.`,
+        `Nothing was synced and nothing was changed. ${REWIND_ANSWERS} Either way the commits stay kept in this ` +
+        `folder under ${keptUnder}.`,
     );
     this.name = 'HostRewoundError';
     this.dropped = dropped;
@@ -194,7 +205,7 @@ function redact(text: string): string {
       if (q >= 0) r = `${r.slice(0, q)}?***`;
       return scheme + r;
     })
-    .replace(/(^|[\s'"(=])[^\s'"@/:]+:[^\s'"@]*@(?=[^\s'"@/:]+:)/g, '$1***@');
+    .replace(/(^|[\s'"(=])[^\s'"@/:]+:(?!\/\/)[^\s'"@]*@(?=[^\s'"@/:]+:)/g, '$1***@');
 }
 
 function failure(args: string[], err: unknown, stderrText: string): GitError {
@@ -292,6 +303,11 @@ function parseRaw(out: string): RawEntry[] {
 // ---------------------------------------------------------------------------
 
 const NETSCAPE = '# Netscape HTTP Cookie File';
+/** A browser's cookie database: an SQLite file whose schema has a `cookies` (Chromium) or `moz_cookies` (Firefox) table. */
+const SQLITE_MAGIC = 'SQLite format 3\u0000';
+const COOKIE_TABLE = /CREATE TABLE\s+["'`[]?(?:moz_)?cookies["'`\]]?\s*\(/i;
+/** Text kept from the end of one piece so that a needle split across two pieces is still found. */
+const NEEDLE_TAIL = 64;
 
 /** Finds the cookie needles in a stream of text pieces, including a needle split across two pieces. */
 class NeedleMatcher {
@@ -299,9 +315,11 @@ class NeedleMatcher {
   private netscape = false;
   private sameSite = false;
   private httpOnly = false;
+  private sqlite = false;
+  private cookieTable = false;
 
   get hit(): boolean {
-    return this.netscape || (this.sameSite && this.httpOnly);
+    return this.netscape || (this.sameSite && this.httpOnly) || (this.sqlite && this.cookieTable);
   }
 
   scan(text: string): void {
@@ -309,7 +327,9 @@ class NeedleMatcher {
     if (s.includes(NETSCAPE)) this.netscape = true;
     if (s.includes('"sameSite"')) this.sameSite = true;
     if (s.includes('"httpOnly"')) this.httpOnly = true;
-    this.tail = s.slice(-(NETSCAPE.length - 1));
+    if (s.includes(SQLITE_MAGIC)) this.sqlite = true;
+    if (COOKIE_TABLE.test(s)) this.cookieTable = true;
+    this.tail = s.slice(-NEEDLE_TAIL);
   }
 }
 
@@ -1515,9 +1535,33 @@ async function dirtyPaths(dir: string): Promise<Set<string>> {
   return new Set(splitZ(out));
 }
 
+/**
+ * An OS file (`.DS_Store`, `Thumbs.db`, `desktop.ini`) in the way of the move, untracked or changed, gives way to
+ * the incoming version: sync never commits such a file, so waiting for it would stall every later sync (G1).
+ * The OS makes a new one when it needs it.
+ */
+async function clearOsJunkInWay(dir: string, local: string, moving: Set<string>): Promise<void> {
+  const junk = [...moving].filter(isOsJunk);
+  if (junk.length === 0) return;
+  const dirty = await dirtyPaths(dir);
+  const untracked = new Set(await untrackedPaths(dir));
+  const inWay = junk.filter((p) => dirty.has(p) || untracked.has(p));
+  if (inWay.length === 0) return;
+  const inHead = new Set(splitZ(await run(dir, ['ls-tree', '-r', '-z', '--name-only', local], { latin1: true })));
+  const tracked = inWay.filter((p) => inHead.has(p));
+  const loose = inWay.filter((p) => !inHead.has(p));
+  if (tracked.length > 0) await run(dir, ['checkout', '-q', local, ...PATHSPEC_STDIN], { input: pathInput(tracked) });
+  if (loose.length > 0) {
+    const drop = loose.map((p) => `0 ${ZERO_SHA}\t${p}\0`).join(''); // out of the index if it was staged by hand
+    await run(dir, ['update-index', '-z', '--index-info'], { input: Buffer.from(drop, 'latin1') });
+    for (const p of loose) fs.rmSync(absPath(dir, p).toString(), { force: true });
+  }
+}
+
 /** Move HEAD, the index and the files from `local` to `target`, unless that would touch a file the user changed. */
 async function moveTo(dir: string, local: string, target: string): Promise<Integration> {
   const moving = await changedBetween(dir, local, target);
+  await clearOsJunkInWay(dir, local, moving);
   for (const p of await dirtyPaths(dir)) if (moving.has(p)) return 'busy';
   for (let attempt = 0; ; attempt++) {
     try {
@@ -1546,11 +1590,17 @@ type Progress = {
   resolved: Set<string>;
   rewrites: Map<string, string | null>;
   made: Made[];
-  /** Commits an accepted host rewind dropped from local `main`, and the ref that keeps them. */
-  rewound: { dropped: number; keptUnder: string } | null;
+  /** Commits an accepted host rewind dropped from local `main` (each once), and the ref that keeps them. */
+  dropped: Set<string>;
+  keptUnder: string | null;
+  /** The tip `restoreHost` pushed back to the host, if it did. */
+  restoredTo: string | null;
 };
 
-const newProgress = (): Progress => ({ resolved: new Set(), rewrites: new Map(), made: [], rewound: null });
+const newProgress = (): Progress => ({ resolved: new Set(), rewrites: new Map(), made: [], dropped: new Set(), keptUnder: null, restoredTo: null });
+
+const rewoundOf = (p: Progress): SyncResult['rewound'] =>
+  p.dropped.size > 0 && p.keptUnder !== null ? { dropped: p.dropped.size, keptUnder: p.keptUnder } : null;
 
 /**
  * How many commits on local `main` (HEAD) were once on `origin/main` at this address (the seen record holds
@@ -1558,17 +1608,38 @@ const newProgress = (): Progress => ({ resolved: new Set(), rewrites: new Map(),
  * the remote holds HEAD, or when it only lacks commits never pushed (a host rewrite of commits this checkout
  * never had drops nothing here).
  */
-async function droppedByRemote(dir: string, remote: { address: string; tip: string }): Promise<number> {
+async function droppedByRemote(dir: string, remote: { address: string; tip: string }): Promise<string[]> {
   const local = (await git(dir, ['rev-parse', 'HEAD'])).trim();
-  if (local === remote.tip) return 0;
+  if (local === remote.tip) return [];
   const ahead = (await run(dir, ['rev-list', '--stdin'], { input: `${local}\n^${remote.tip}\n` })).split('\n').filter(Boolean);
-  if (ahead.length === 0) return 0;
+  if (ahead.length === 0) return [];
   const seen = await revOrNull(dir, seenRef(dir, remote.address));
-  if (seen === null) return 0;
-  const neverPushed = (await run(dir, ['rev-list', '--stdin'], { input: `${local}\n^${remote.tip}\n^${seen}\n` }))
-    .split('\n')
-    .filter(Boolean);
-  return ahead.length - neverPushed.length;
+  if (seen === null) return [];
+  const neverPushed = new Set(
+    (await run(dir, ['rev-list', '--stdin'], { input: `${local}\n^${remote.tip}\n^${seen}\n` })).split('\n').filter(Boolean),
+  );
+  return ahead.filter((c) => !neverPushed.has(c));
+}
+
+/**
+ * `restoreHost`: the host's rollback was a mistake. Push local `main` (HEAD, before any new local commit) back
+ * as a fast-forward, after the secret guard, and record it. A host whose history was rewritten (its tip is not
+ * an ancestor of local `main`) cannot be restored that way: `GitError`, and nothing changes.
+ */
+async function restoreHostTo(dir: string, remote: { address: string; tip: string }): Promise<string> {
+  const head = (await git(dir, ['rev-parse', 'HEAD'])).trim();
+  if (!(await isAncestor(dir, remote.tip, head))) {
+    throw new GitError(
+      `The git host's ${BRANCH} branch was rewritten, not rolled back: its history is not an earlier point of this data ` +
+        'repo, so it cannot be restored by a sync. Nothing was synced and nothing was changed. To follow the host ' +
+        'instead, sync again accepting the rollback (acceptRewind).',
+    );
+  }
+  assertUnpushedClean(dir, remote.tip);
+  await git(dir, ['push', REMOTE, `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]);
+  await git(dir, ['update-ref', '-m', 'cob: restore host', `refs/remotes/${REMOTE}/${BRANCH}`, head]);
+  await recordSeen(dir, remote.address, head);
+  return head;
 }
 
 /** The remote after a fetch: its address, and its tip, or null when it has no `main` yet (a first push). */
@@ -1637,6 +1708,9 @@ async function settle(
   opts: SyncOptions,
 ): Promise<RemoteState> {
   const hooks = hooksOf(opts);
+  if (opts.acceptRewind && opts.restoreHost) {
+    throw new GitError('acceptRewind and restoreHost are two different answers to a host rollback; pass one of them.');
+  }
   for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
     let remote: RemoteState;
     try {
@@ -1651,10 +1725,17 @@ async function settle(
     }
     if (remote.tip !== null) {
       const dropped = await droppedByRemote(dir, { address: remote.address, tip: remote.tip });
-      if (dropped > 0) {
+      if (dropped.length > 0) {
         const keptUnder = seenRef(dir, remote.address);
-        if (!opts.acceptRewind) throw new HostRewoundError(dropped, keptUnder);
-        p.rewound = { dropped: (p.rewound?.dropped ?? 0) + dropped, keptUnder };
+        if (opts.restoreHost) {
+          p.restoredTo = await restoreHostTo(dir, { address: remote.address, tip: remote.tip });
+          remote = { address: remote.address, tip: p.restoredTo };
+        } else if (opts.acceptRewind) {
+          for (const c of dropped) p.dropped.add(c);
+          p.keptUnder = keptUnder;
+        } else {
+          throw new HostRewoundError(dropped.length, keptUnder);
+        }
       }
     }
     const made = await stageAndCommit(dir, message);
@@ -1684,15 +1765,23 @@ const sorted = (set: Set<string>) => [...set].map(display).sort();
 export async function pullRepo(dir: string, writer: Writer, opts: PullOptions = {}): Promise<SyncResult> {
   return guarded(dir, async (gitDir) => {
     const p = newProgress();
-    await settle(dir, gitDir, writer, 'sync: local changes before pull', p, opts);
-    return { committed: await lastSurvivor(dir, p), pushed: false, resolved: sorted(p.resolved), rewound: p.rewound };
+    const remote = await settle(dir, gitDir, writer, 'sync: local changes before pull', p, opts);
+    // pullRepo pushes only to restore the host (`restoreHost`); `pushed` then says whether the host equals HEAD.
+    const head = (await git(dir, ['rev-parse', 'HEAD'])).trim();
+    const pushed = p.restoredTo !== null && remote.tip === head;
+    return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved), rewound: rewoundOf(p) };
   });
 }
 
 /** A push the remote refused because it moved. */
 const NON_FAST_FORWARD = /\[rejected\]|fetch first/;
-/** A push that lost a race for the ref lock: the remote moved, or is moving. Treated like a non-fast-forward. */
-const LOCK_RACE = /cannot lock ref|failed to update ref/;
+/**
+ * A push that lost a race for the ref lock: the remote's ref moved between reading and locking ("is at <sha> but
+ * expected <sha>"). Treated like a non-fast-forward: retried, then `pushed: false`.
+ */
+const LOCK_RACE = /is at [0-9a-f]{7,} but expected [0-9a-f]{7,}/;
+/** Any other lock or ref-update failure (a lock file left by a crashed git on the host, say): retried, then `GitError`. */
+const LOCK_FAILURE = /cannot lock ref|failed to update ref|failed to lock/;
 
 /**
  * Commit local changes with `message`, pull with owner-wins conflict resolution, and push.
@@ -1712,6 +1801,7 @@ export async function syncRepo(dir: string, writer: Writer, message: string, opt
   return guarded(dir, async (gitDir) => {
     const p = newProgress();
     let pushed = false;
+    let lockFailure: GitError | null = null;
     for (let attempt = 1; attempt <= maxAttempts && !pushed; attempt++) {
       const remote = await settle(dir, gitDir, writer, message, p, opts);
       const head = (await git(dir, ['rev-parse', 'HEAD'])).trim();
@@ -1726,9 +1816,13 @@ export async function syncRepo(dir: string, writer: Writer, message: string, opt
         pushed = true;
         await recordSeen(dir, remote.address, head);
       } catch (err) {
-        if (!(err instanceof GitError) || !(NON_FAST_FORWARD.test(err.stderr) || LOCK_RACE.test(err.stderr))) throw err;
+        if (!(err instanceof GitError)) throw err;
+        if (NON_FAST_FORWARD.test(err.stderr) || LOCK_RACE.test(err.stderr)) lockFailure = null;
+        else if (LOCK_FAILURE.test(err.stderr)) lockFailure = err;
+        else throw err;
       }
     }
-    return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved), rewound: p.rewound };
+    if (!pushed && lockFailure) throw lockFailure;
+    return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved), rewound: rewoundOf(p) };
   });
 }

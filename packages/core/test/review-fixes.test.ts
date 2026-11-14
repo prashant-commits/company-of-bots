@@ -747,14 +747,45 @@ test('F14 probe p14: .DS_Store, Thumbs.db and desktop.ini are never committed or
 // F15: a push that loses a ref-lock race on every try
 // ---------------------------------------------------------------------------
 
-test('F15 a push that loses the ref lock on every retry gives pushed: false, not a GitError, and goes out next time', async () => {
+/**
+ * Run `fn` with a `git` first on PATH that answers every push with `pushStderr` (exit 1) and passes everything
+ * else to the real git. Returns how many pushes were tried.
+ */
+async function withFailingPush(pushStderr: string, fn: () => Promise<void>): Promise<number> {
+  const saved = process.env.PATH;
+  const realGit = execFileSync('sh', ['-c', 'command -v git']).toString().trim();
+  const bin = tmpDir();
+  const msg = path.join(bin, 'msg');
+  const count = path.join(bin, 'pushes');
+  fs.writeFileSync(msg, pushStderr);
+  fs.writeFileSync(count, '');
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    `#!/bin/sh\nfor a in "$@"; do [ "$a" = "push" ] && { echo x >> "${count}"; cat "${msg}" >&2; exit 1; }; done\nexec "${realGit}" "$@"\n`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${bin}${path.delimiter}${saved}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = saved;
+  }
+  return fs.readFileSync(count, 'utf8').split('\n').filter(Boolean).length;
+}
+
+test.runIf(process.platform !== 'win32')('F15 a push that loses the ref-lock race on every retry gives pushed: false, not a GitError, and goes out next time', async () => {
   const t = await trio();
-  fs.writeFileSync(path.join(t.remote, 'refs/heads/main.lock'), '');
   write(t.agentDir, 'mine.txt', 'mine\n');
-  const r = await syncRepo(t.agentDir, 'agent', 'mine');
-  expect(r.pushed).toBe(false);
-  expect(r.committed).not.toBeNull();
-  fs.unlinkSync(path.join(t.remote, 'refs/heads/main.lock'));
+  const race =
+    "To /srv/data.git\n ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at " +
+    `${'1'.repeat(40)} but expected ${'2'.repeat(40)})\nerror: failed to push some refs to '/srv/data.git'\n`;
+  let r: Awaited<ReturnType<typeof syncRepo>> | undefined;
+  const pushes = await withFailingPush(race, async () => {
+    r = await syncRepo(t.agentDir, 'agent', 'mine');
+  });
+  expect(pushes).toBe(3); // every retry was tried
+  expect(r!.pushed).toBe(false);
+  expect(r!.committed).not.toBeNull();
   expect((await syncRepo(t.agentDir, 'agent', 'retry')).pushed).toBe(true);
   expect(tree(t.remote)).toContain('mine.txt');
 }, T);

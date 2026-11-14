@@ -1064,10 +1064,12 @@ test('S11 on another branch or a detached HEAD: GitError, nothing pushed, never 
 
 // --- S12: only an exhausted non-fast-forward gives pushed:false ------------------
 
-test('S12 (replaced by F15) a lock failure on the remote on every retry is pushed: false, not a GitError; the commit goes out next time', async () => {
+test('S12 (restored by G2) a lasting lock failure on the remote is a GitError after the retries, not pushed:false', async () => {
   fs.writeFileSync(path.join(remote, 'refs/heads/main.lock'), '');
   write(agentDir, 'mine.txt', 'mine\n');
-  expect(await syncRepo(agentDir, 'agent', 'mine')).toMatchObject({ pushed: false });
+  const err = (await syncRepo(agentDir, 'agent', 'mine').catch((e: unknown) => e)) as GitError;
+  expect(err).toBeInstanceOf(GitError);
+  expect(err.stderr).toMatch(/lock/);
   fs.unlinkSync(path.join(remote, 'refs/heads/main.lock'));
   expect((await syncRepo(agentDir, 'agent', 'retry')).pushed).toBe(true);
   expect(remoteTree()).toContain('mine.txt');
