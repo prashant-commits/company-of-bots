@@ -37,8 +37,7 @@ One source is one file, named after its id (for example \`s1.json\`):
 - \`addedBy\` is \`user\` or \`interview\`.
 `;
 
-const GITIGNORE = `# Cookies and secrets never belong in this repo.
-cookies/
+const GITIGNORE = `cookies/
 *.cookies.json
 storage-state*.json
 secrets/

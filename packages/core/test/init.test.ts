@@ -57,6 +57,8 @@ test('B1 writes exactly the documented files', () => {
   expect(PRIVATE_REPO_NOTICE).toBe('This private repo holds your interview transcripts and your resume files. Keep it private.');
   const ignore = fs.readFileSync(path.join(dir, '.gitignore'), 'utf8').split('\n');
   for (const line of ['cookies/', '*.cookies.json', 'storage-state*.json', 'secrets/', '.env*']) expect(ignore).toContain(line);
+  // S16: exactly these five lines, so a sixth entry (or a comment) fails the test.
+  expect(ignore.filter((l) => l.trim() !== '')).toEqual(['cookies/', '*.cookies.json', 'storage-state*.json', 'secrets/', '.env*']);
 });
 
 test('B1 the example source URL appears only inside a fenced example block', () => {
