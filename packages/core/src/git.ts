@@ -46,9 +46,11 @@ const BASE_FLAGS = [
   'commit.gpgsign=false',
   '-c',
   `core.hooksPath=${os.devNull}`,
-  // The reflog of origin/main records every tip the remote had, so a rewrite on the host can be recognised (R5).
+  // No line-ending or attribute conversion from the user's config: files are committed and written byte for byte.
   '-c',
-  'core.logAllRefUpdates=true',
+  'core.autocrlf=false',
+  '-c',
+  `core.attributesFile=${os.devNull}`,
 ];
 /**
  * Env on every call: never prompt (the process is unattended), never open an editor,
@@ -542,17 +544,17 @@ function writeInitMarker(gitDir: string, commit: string | null): void {
   fs.renameSync(temp, file);
 }
 
-/** The relative paths `initDataLayout` writes. */
-function layoutPaths(scratchParent: string): Set<string> {
+/** What `initDataLayout` writes: relative path → bytes. Generated in a scratch folder under `scratchParent`. */
+function layoutFiles(scratchParent: string): Map<string, Buffer> {
   const scratch = fs.mkdtempSync(path.join(scratchParent, 'cob-layout-'));
   try {
     initDataLayout(scratch);
-    const out = new Set<string>();
+    const out = new Map<string, Buffer>();
     const walk = (rel: string) => {
       for (const name of fs.readdirSync(path.join(scratch, rel))) {
         const r = rel ? `${rel}/${name}` : name;
         if (fs.statSync(path.join(scratch, r)).isDirectory()) walk(r);
-        else out.add(r);
+        else out.set(r, fs.readFileSync(path.join(scratch, r)));
       }
     };
     walk('');
@@ -562,16 +564,35 @@ function layoutPaths(scratchParent: string): Set<string> {
   }
 }
 
+/**
+ * A layout file found when resuming an init killed before its commit. It is kept as it is when it holds
+ * exactly what init writes, or is complete JSON (DataRepo writes JSON atomically, so the app may have saved
+ * its own version since). Anything else (a half-written text file, a user's edit) refuses the resume.
+ */
+function keepableLayoutFile(abs: string, expected: Buffer): boolean {
+  const bytes = fs.readFileSync(abs);
+  if (bytes.equals(expected)) return true;
+  if (!abs.endsWith('.json')) return false;
+  try {
+    JSON.parse(bytes.toString('utf8'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 type InitTarget =
   | { kind: 'fresh' }
   | { kind: 'not-empty' }
   | { kind: 'foreign' }
-  /** Ours, interrupted before the init commit: `leftovers` are layout files a killed call wrote. */
-  | { kind: 'uncommitted'; gitDir: string; leftovers: string[] }
+  /** Ours, interrupted before the init commit, but holding a file init would not keep: refused (R18). */
+  | { kind: 'resume-blocked'; path: string }
+  /** Ours, interrupted before the init commit. Layout files already there are kept; the rest are written. */
+  | { kind: 'uncommitted'; gitDir: string; layout: Map<string, Buffer> }
   /** Ours, with the init commit made; the first push may not have happened. */
   | { kind: 'committed'; gitDir: string; commit: string };
 
-/** What is in `dir` already: nothing, a repo `initPrivateRepo` made (proven by its marker), or something else. */
+/** What is in `dir` already: nothing, a repo `initPrivateRepo` made (proven by its marker), or something else. Read-only. */
 async function inspectInitTarget(dir: string): Promise<InitTarget> {
   if (!fs.existsSync(dir)) return { kind: 'fresh' };
   const entries = fs.readdirSync(dir);
@@ -598,19 +619,31 @@ async function inspectInitTarget(dir: string): Promise<InitTarget> {
   );
   if (marker.commit === null) {
     if (head !== null) return { kind: 'foreign' };
-    const layout = layoutPaths(gitDir);
-    const present = splitZ(await run(dir, ['ls-files', '-o', '-z'], { latin1: true })).map(display);
-    return present.every((p) => layout.has(p)) ? { kind: 'uncommitted', gitDir, leftovers: present } : { kind: 'not-empty' };
+    const layout = layoutFiles(gitDir);
+    const present = splitZ(await run(dir, ['ls-files', '-o', '-z'], { latin1: true })).filter((p) => !TEMP_FILE.test(p));
+    for (const p of present) {
+      const expected = layout.get(display(p));
+      if (expected === undefined || !keepableLayoutFile(absPath(dir, p).toString(), expected)) return { kind: 'resume-blocked', path: display(p) };
+    }
+    return { kind: 'uncommitted', gitDir, layout };
   }
   if (head === null) return { kind: 'foreign' };
   const roots = (await git(dir, ['rev-list', '--max-parents=0', 'HEAD'])).split('\n').filter(Boolean);
   return roots.length === 1 && roots[0] === marker.commit ? { kind: 'committed', gitDir, commit: marker.commit } : { kind: 'foreign' };
 }
 
-/** Make the init commit from the layout: the marker names it before `main` points at it. */
-async function commitLayout(dir: string, gitDir: string): Promise<void> {
-  initDataLayout(dir);
-  await git(dir, ['add', '-A']);
+/**
+ * Write the layout files that are missing (never replacing one that is there) and make the init commit
+ * from exactly those paths. The marker names the commit before `main` points at it.
+ */
+async function commitLayout(dir: string, gitDir: string, layout: Map<string, Buffer>): Promise<void> {
+  for (const [rel, bytes] of layout) {
+    const abs = path.join(dir, rel);
+    if (fs.existsSync(abs)) continue;
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, bytes, { flag: 'wx' });
+  }
+  await run(dir, ['update-index', '--add', '-z', '--stdin'], { input: pathInput([...layout.keys()].map(toBytes)) });
   const tree = (await git(dir, ['write-tree'])).trim();
   const commit = (await run(dir, ['commit-tree', tree, '-F', '-'], { input: `${COMMIT_MESSAGE_INIT}\n` })).trim();
   writeInitMarker(gitDir, commit);
@@ -623,12 +656,16 @@ async function remoteMainOf(cwd: string, remote: string): Promise<string> {
   return heads.trim().split(/\s+/)[0] ?? '';
 }
 
+const REMOTE_HAS_MAIN = `The remote already has a ${BRANCH} branch that is not this data repo's; use an empty repo. Nothing was changed.`;
+
 /**
  * Create a private data repo in `dir` (created if missing): branch `main`, local identity, the starting
  * layout in one commit, and, when `remote` is given, `origin` with `main` pushed and tracked.
  * A repo this function created (proven by the marker it writes in the git dir) is resumed: a call that was
  * interrupted finishes the layout commit and the first push, even if more commits were made since.
- * A folder that is already a repository this function did not create is refused and left unchanged.
+ * Every check runs before anything is written: a refused call (a folder that is not empty, a repository
+ * this function did not create, a remote whose `main` is not this repo's, a bad remote string, a secret in
+ * the history) changes nothing, not even `origin` or the identity.
  */
 export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity; remote?: string }): Promise<void> {
   assertIdentity(opts.identity);
@@ -640,26 +677,37 @@ export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity
   if (target.kind === 'foreign') {
     throw new GitError(`${dir} is already a git repository that this app did not create; it was not changed.`);
   }
-
-  // Fail before touching the folder, so a wrong address can be fixed and tried again.
-  const remoteMain = remote === undefined ? '' : await remoteMainOf(process.cwd(), remote);
-  if (remoteMain && target.kind !== 'committed') {
-    throw new GitError(`The remote already has a ${BRANCH} branch; use an empty repo.`);
+  if (target.kind === 'resume-blocked') {
+    throw new GitError(
+      `Cannot finish setting up the data repo in ${dir}: the folder is not empty (${target.path} is not a file set-up ` +
+        'would keep). Nothing was changed.',
+    );
   }
 
+  // Checks first, read-only.
+  const remoteMain = remote === undefined ? '' : await remoteMainOf(process.cwd(), remote);
+  if (remoteMain && target.kind !== 'committed') throw new GitError(REMOTE_HAS_MAIN);
+  if (remote !== undefined && target.kind === 'committed') {
+    if (remoteMain) {
+      // Done already only if the remote holds our init commit. Objects only: no ref, no FETCH_HEAD, no config.
+      await git(dir, ['fetch', '-q', '--no-write-fetch-head', remote, `refs/heads/${BRANCH}`]);
+      if (!(await isAncestor(dir, target.commit, remoteMain))) throw new GitError(REMOTE_HAS_MAIN);
+    } else {
+      assertUnpushedClean(dir, null);
+    }
+  }
+
+  // Changes.
   if (target.kind === 'fresh') {
     fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
     writeInitMarker(path.join(dir, '.git'), null);
     await git(dir, ['init', '-q', '-b', BRANCH]);
     await setIdentity(dir, opts.identity);
-    await commitLayout(dir, (await git(dir, ['rev-parse', '--absolute-git-dir'])).trim());
+    const gitDir = (await git(dir, ['rev-parse', '--absolute-git-dir'])).trim();
+    await commitLayout(dir, gitDir, layoutFiles(gitDir));
   } else if (target.kind === 'uncommitted') {
-    for (const rel of target.leftovers) fs.rmSync(path.join(dir, rel), { force: true });
-    for (const name of fs.readdirSync(dir)) {
-      if (name !== '.git') fs.rmSync(path.join(dir, name), { recursive: true, force: true }); // empty layout folders only
-    }
     await setIdentity(dir, opts.identity);
-    await commitLayout(dir, target.gitDir);
+    await commitLayout(dir, target.gitDir, target.layout);
   } else {
     await setIdentity(dir, opts.identity);
   }
@@ -670,18 +718,16 @@ export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity
     () => false,
   );
   await git(dir, hasOrigin ? ['remote', 'set-url', REMOTE, remote] : ['remote', 'add', REMOTE, remote]);
+  const address = await originAddress(dir);
   if (remoteMain) {
-    // Resuming: done already if the remote holds our init commit; anything else is someone else's main.
-    await git(dir, ['fetch', '-q', REMOTE, BRANCH]);
-    const commit = target.kind === 'committed' ? target.commit : '';
-    if (!(await isAncestor(dir, commit, `refs/remotes/${REMOTE}/${BRANCH}`))) {
-      throw new GitError(`The remote already has a ${BRANCH} branch; use an empty repo.`);
-    }
+    await git(dir, ['update-ref', '-m', 'cob: init found its commit on the remote', `refs/remotes/${REMOTE}/${BRANCH}`, remoteMain]);
     await git(dir, ['branch', '-q', `--set-upstream-to=${REMOTE}/${BRANCH}`, BRANCH]);
+    await recordSeen(dir, address, remoteMain);
     return;
   }
   assertUnpushedClean(dir, null);
   await git(dir, ['push', '-q', '-u', REMOTE, `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]);
+  await recordSeen(dir, address, (await git(dir, ['rev-parse', 'HEAD'])).trim());
 }
 
 /** Clone the user's data repo into `dir` (which must not exist or must be empty, as for `git clone`). */
@@ -692,6 +738,8 @@ export async function cloneDataRepo(remote: string, dir: string, identity: GitId
   await git(process.cwd(), ['clone', '-q', '--branch', BRANCH, '--', remote, target]);
   await assertTopLevel(target);
   await setIdentity(target, identity);
+  const tip = (await git(target, ['rev-parse', '--verify', '-q', `refs/remotes/${REMOTE}/${BRANCH}`]).catch(() => '')).trim();
+  if (tip) await recordSeen(target, await originAddress(target), tip);
 }
 
 // ---------------------------------------------------------------------------
@@ -790,18 +838,8 @@ async function withLock<T>(gitDir: string, fn: () => Promise<T>): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Recovering a rebase that something else left behind
+// Git operations the user started by hand
 // ---------------------------------------------------------------------------
-
-/** The folder of a rebase in progress (`rebase-merge` or `rebase-apply`), or null. */
-async function rebaseStateDir(dir: string): Promise<string | null> {
-  const out = await git(dir, ['rev-parse', '--git-path', 'rebase-merge', '--git-path', 'rebase-apply']);
-  for (const p of out.split('\n').filter(Boolean)) {
-    const abs = path.resolve(dir, p);
-    if (fs.existsSync(abs)) return abs;
-  }
-  return null;
-}
 
 /** Untracked files that the repo's own .gitignore files do not ignore (byte strings). */
 async function untrackedPaths(dir: string): Promise<string[]> {
@@ -809,219 +847,37 @@ async function untrackedPaths(dir: string): Promise<string[]> {
   return splitZ(out).filter((p) => !p.endsWith('/'));
 }
 
-/** `kind:sha` of a tree or index entry: `f` regular file, `l` symlink, `g` gitlink. */
-type Key = string;
-const NONE: Key = 'none';
-const entKey = (mode: string, sha: string): Key => `${mode === '120000' ? 'l' : mode === '160000' ? 'g' : 'f'}:${sha}`;
-
-async function treeKeys(dir: string, rev: string): Promise<Map<string, Key>> {
-  const map = new Map<string, Key>();
-  for (const entry of splitZ(await run(dir, ['ls-tree', '-r', '-z', '--full-tree', rev], { latin1: true }))) {
-    const m = /^(\d+) \w+ ([0-9a-f]+)\t([\s\S]*)$/.exec(entry);
-    if (m) map.set(m[3]!, entKey(m[1]!, m[2]!));
-  }
-  return map;
-}
-
-type IndexState = { stage0: Key | null; stages: Key[] };
-
-async function indexKeys(dir: string): Promise<Map<string, IndexState>> {
-  const map = new Map<string, IndexState>();
-  for (const entry of splitZ(await run(dir, ['ls-files', '-s', '-z'], { latin1: true }))) {
-    const m = /^(\d+) ([0-9a-f]+) (\d)\t([\s\S]*)$/.exec(entry);
-    if (!m) continue;
-    const st = map.get(m[4]!) ?? { stage0: null, stages: [] };
-    if (m[3] === '0') st.stage0 = entKey(m[1]!, m[2]!);
-    else st.stages.push(entKey(m[1]!, m[2]!));
-    map.set(m[4]!, st);
-  }
-  return map;
-}
-
-/** The key of what is on disk at `rel`: a file's or symlink's blob id, `none`, or `dir` for a folder. */
-async function worktreeKey(dir: string, rel: string, objectFormat: 'sha1' | 'sha256'): Promise<Key> {
-  const abs = absPath(dir, rel);
-  let st: fs.Stats;
-  try {
-    st = fs.lstatSync(abs);
-  } catch {
-    return NONE;
-  }
-  if (st.isDirectory()) return 'dir';
-  const hash = createHash(objectFormat);
-  if (st.isSymbolicLink()) {
-    const target = fs.readlinkSync(abs, { encoding: 'buffer' });
-    hash.update(`blob ${target.length}\0`);
-    hash.update(target);
-    return `l:${hash.digest('hex')}`;
-  }
-  if (!st.isFile()) return 'other';
-  hash.update(`blob ${st.size}\0`);
-  const fd = fs.openSync(abs, 'r');
-  try {
-    const buf = Buffer.allocUnsafe(1024 * 1024);
-    let total = 0;
-    for (;;) {
-      const n = fs.readSync(fd, buf, 0, buf.length, null);
-      if (n === 0) break;
-      hash.update(buf.subarray(0, n));
-      total += n;
-    }
-    if (total !== st.size) return 'changing';
-  } finally {
-    fs.closeSync(fd);
-  }
-  return `f:${hash.digest('hex')}`;
-}
-
-function readState(stateDir: string, name: string): string | null {
-  try {
-    return fs.readFileSync(path.join(stateDir, name), 'utf8').trim();
-  } catch {
-    return null;
-  }
-}
-
-function recoveryRefused(why: string, paths: string[] = []): GitError {
-  return new GitError(
-    `A git rebase is in progress in this data repo and it could not be cleared safely, so nothing was synced and ` +
-      `no file was changed: ${why}${paths.length ? ` (${paths.map(display).join(', ')})` : ''}. ` +
-      'Finish it with `git rebase --continue`, or keep a copy of your edits and run `git rebase --abort`, then sync again.',
-  );
-}
+/** The file or folder in the git dir that marks each operation, and how the user finishes it. */
+const OPERATIONS: { mark: string; name: string; finish: string }[] = [
+  { mark: 'rebase-merge', name: 'A rebase', finish: '`git rebase --continue` (after resolving any conflict) or `git rebase --abort`' },
+  { mark: 'rebase-apply', name: 'A rebase', finish: '`git rebase --continue` (after resolving any conflict) or `git rebase --abort`' },
+  { mark: 'MERGE_HEAD', name: 'A merge', finish: '`git merge --continue` (after resolving the conflict and `git add`) or `git merge --abort`' },
+  { mark: 'CHERRY_PICK_HEAD', name: 'A cherry-pick', finish: '`git cherry-pick --continue` (after resolving the conflict) or `git cherry-pick --abort`' },
+  { mark: 'REVERT_HEAD', name: 'A revert', finish: '`git revert --continue` (after resolving the conflict) or `git revert --abort`' },
+  { mark: 'sequencer', name: 'A cherry-pick or revert', finish: '`git cherry-pick --continue` / `git revert --continue`, or `--abort`' },
+];
 
 /**
- * A sync never starts a rebase, but the user's own git (or a process killed by an older version) can leave
- * one behind. Clear it without losing an edit, and without `git rebase --abort`, which resets the files.
- *
- * The rebase wrote its own state to disk: the detached HEAD's files, and, after a conflict, the merge result
- * with conflict markers (git records that tree as `AUTO_MERGE`). A path whose file and staged content are one
- * of those versions, or the branch's own version, is untouched: it goes back to the branch's version. Any
- * other path holds the user's edit (a new or changed file, a resolved conflict, a deletion) and is left on
- * disk exactly as it is, so the next commit picks it up. The branch, which the rebase never moved, stays
- * where it was; HEAD goes back to it and the index is reset to it. If an edit cannot be kept this way
- * (staged content that differs from the file on disk, commits made during the rebase, a file and a folder
- * of the same name), nothing is changed and `GitError` explains why.
+ * Sync never starts a rebase, merge, cherry-pick, revert or `am`, so one in progress is the user's own.
+ * Clearing it automatically has always risked dropping some of the user's work, so it is refused: nothing
+ * is fetched, committed or pushed, and the operation, HEAD, the index and every file stay as they are.
  */
-async function recoverRebase(dir: string, gitDir: string): Promise<void> {
-  const stateDir = await rebaseStateDir(dir);
-  if (stateDir === null) return;
-  const headName = readState(stateDir, 'head-name');
-  const orig = readState(stateDir, 'orig-head');
-  const onto = readState(stateDir, 'onto');
-  if (headName !== `refs/heads/${BRANCH}`) throw recoveryRefused(`it is rebasing ${headName ?? 'an unknown branch'}, not ${BRANCH}`);
-  const mainSha = (await git(dir, ['rev-parse', '--verify', '-q', `refs/heads/${BRANCH}`]).catch(() => '')).trim();
-  if (!orig || mainSha !== orig) throw recoveryRefused(`${BRANCH} has moved since the rebase started`);
-  const head = (await git(dir, ['rev-parse', '--verify', '-q', 'HEAD']).catch(() => '')).trim();
-  if (!head) throw recoveryRefused('HEAD is unreadable');
-
-  // Commits made by hand on the detached HEAD would be dropped: refuse.
-  const rewritten = [readState(stateDir, 'rewritten-list'), readState(stateDir, 'rewritten')]
-    .flatMap((t) => (t ?? '').split('\n'))
-    .flatMap((line) => line.trim().split(/\s+/))
-    .filter((s) => /^[0-9a-f]{40,64}$/.test(s));
-  const exclude = [orig, ...(onto ? [onto] : []), ...rewritten].map((s) => `^${s}`).join('\n');
-  const extra = (await run(dir, ['rev-list', '--stdin'], { input: `${head}\n${exclude}\n` })).trim();
-  if (extra) throw recoveryRefused('commits were made during the rebase that are not on any branch');
-
-  const objectFormat = (await git(dir, ['rev-parse', '--show-object-format']).catch(() => 'sha1')).trim() === 'sha256' ? 'sha256' : 'sha1';
-  const autoMerge = (await git(dir, ['rev-parse', '--verify', '-q', 'AUTO_MERGE']).catch(() => '')).trim();
-  const O = await treeKeys(dir, orig);
-  const H = await treeKeys(dir, head);
-  const A = autoMerge ? await treeKeys(dir, autoMerge) : null;
-  const index = await indexKeys(dir);
-  const candidates = new Set<string>([...O.keys(), ...H.keys(), ...(A ? A.keys() : []), ...index.keys()]);
-  const look = new Set<string>();
-  for (const p of candidates) {
-    const o = O.get(p) ?? NONE;
-    const ix = index.get(p);
-    if ((H.get(p) ?? NONE) !== o || (A && (A.get(p) ?? NONE) !== o) || !ix || ix.stages.length > 0 || ix.stage0 !== o) look.add(p);
+async function assertNoOperation(dir: string): Promise<void> {
+  const out = await git(dir, ['rev-parse', ...OPERATIONS.flatMap((o) => ['--git-path', o.mark])]);
+  const marks = out.split('\n').filter(Boolean);
+  for (let i = 0; i < OPERATIONS.length; i++) {
+    const abs = path.resolve(dir, marks[i] ?? '');
+    if (!marks[i] || !fs.existsSync(abs)) continue;
+    let { name, finish } = OPERATIONS[i]!;
+    if (OPERATIONS[i]!.mark === 'rebase-apply' && fs.existsSync(path.join(abs, 'applying'))) {
+      name = 'A `git am`';
+      finish = '`git am --continue` (after resolving the conflict), `git am --skip`, or `git am --abort`';
+    }
+    throw new GitError(
+      `${name} started with git is still in progress in this data repo, so nothing was synced and nothing was changed. ` +
+        `Finish it with ${finish}, then sync again.`,
+    );
   }
-  for (const p of splitZ(await run(dir, ['diff-files', '--name-only', '-z'], { latin1: true }))) look.add(p);
-  for (const p of await untrackedPaths(dir)) look.add(p);
-
-  const keep: string[] = [];
-  const restore: { rel: string; to: Key }[] = [];
-  const unsafe: string[] = [];
-  for (const p of [...look].sort()) {
-    const o = O.get(p) ?? NONE;
-    const ix = index.get(p);
-    const known = new Set<Key>([o, H.get(p) ?? NONE, ...(A ? [A.get(p) ?? NONE] : []), ...(ix?.stages ?? [])]);
-    if ([...known].some((k) => k.startsWith('g:'))) continue; // never touch a submodule entry
-    let wt = await worktreeKey(dir, p, objectFormat);
-    if (wt === 'dir') wt = NONE;
-    if (wt === 'other' || wt === 'changing') {
-      unsafe.push(p);
-      continue;
-    }
-    const staged = ix === undefined ? NONE : ix.stages.length > 0 ? null : ix.stage0!;
-    if (ix && ix.stages.length > 0 && !A && !known.has(wt)) {
-      unsafe.push(p); // a conflict without AUTO_MERGE: the markers cannot be told apart from an edit
-      continue;
-    }
-    const edited = !known.has(wt);
-    if (staged !== null && staged !== wt && !known.has(staged)) {
-      unsafe.push(p); // staged content that is not on disk would be lost
-      continue;
-    }
-    if (edited) keep.push(p);
-    else if (wt !== o) restore.push({ rel: p, to: o });
-  }
-  if (unsafe.length > 0) throw recoveryRefused('some changes exist only in the index, or files are changing', unsafe);
-  const kept = new Set(keep);
-  const clashes = restore
-    .filter((r) => r.to !== NONE)
-    .filter((r) => keep.some((k) => k.startsWith(`${r.rel}/`)) || ancestors(r.rel).some((a) => kept.has(a)))
-    .map((r) => r.rel);
-  if (clashes.length > 0) throw recoveryRefused('a file and a folder of the same name', clashes);
-
-  // Put untouched paths back to the branch's version: removals first, then files from a scratch index.
-  for (const r of restore.filter((x) => x.to === NONE)) {
-    fs.rmSync(absPath(dir, r.rel), { force: true });
-    for (const a of ancestors(r.rel).reverse()) {
-      try {
-        fs.rmdirSync(absPath(dir, a));
-      } catch {
-        break; // not empty, or gone
-      }
-    }
-  }
-  const back = restore.filter((x) => x.to !== NONE).map((x) => x.rel);
-  if (back.length > 0) {
-    for (const rel of back) {
-      // The rebase's version goes; checkout-index then writes the branch's version (it never overwrites).
-      try {
-        if (fs.lstatSync(absPath(dir, rel)).isDirectory()) fs.rmdirSync(absPath(dir, rel));
-        else fs.rmSync(absPath(dir, rel), { force: true });
-      } catch {
-        // absent, or a folder that is not empty (checkout-index then reports it)
-      }
-    }
-    const scratchIndex = path.join(gitDir, `cob-index-${randomBytes(4).toString('hex')}`);
-    try {
-      await run(dir, ['read-tree', orig], { env: { GIT_INDEX_FILE: scratchIndex } });
-      await run(dir, ['checkout-index', '-z', '--stdin'], { env: { GIT_INDEX_FILE: scratchIndex }, input: pathInput(back) });
-    } finally {
-      fs.rmSync(scratchIndex, { force: true });
-    }
-  }
-  // Back on the branch, with the index at its commit; the files on disk are now the user's edits only.
-  await git(dir, ['symbolic-ref', 'HEAD', `refs/heads/${BRANCH}`]);
-  await git(dir, ['read-tree', orig]);
-  await git(dir, ['update-index', '-q', '--refresh']).catch(() => undefined);
-  for (const name of ['REBASE_HEAD', 'AUTO_MERGE', 'MERGE_MSG']) fs.rmSync(path.join(gitDir, name), { force: true });
-  fs.rmSync(stateDir, { recursive: true, force: true });
-}
-
-/** Parent folders of a path, nearest last: `a/b/c` gives `a`, `a/b`. */
-function ancestors(rel: string): string[] {
-  const out: string[] = [];
-  let slash = rel.indexOf('/');
-  while (slash > 0) {
-    out.push(rel.slice(0, slash));
-    slash = rel.indexOf('/', slash + 1);
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +895,7 @@ async function guarded<T>(dir: string, fn: (gitDir: string) => Promise<T>): Prom
     await assertTopLevel(dir);
     const gitDir = (await git(dir, ['rev-parse', '--absolute-git-dir'])).trim();
     return withLock(gitDir, async () => {
-      await recoverRebase(dir, gitDir);
+      await assertNoOperation(dir);
       const ref = await headRef(dir);
       if (ref !== `refs/heads/${BRANCH}`) {
         throw new GitError(
@@ -1204,32 +1060,68 @@ async function replayCommit(
 
 type Integration = 'done' | 'busy';
 
-/**
- * Every tip `origin/main` has had in this checkout: its reflog (every fetch and push records one), plus the
- * tip before and after this call's fetch. A commit reachable from any of them was on the remote once.
- */
-async function knownRemoteTips(dir: string, before: string | null): Promise<string[]> {
-  const ref = `refs/remotes/${REMOTE}/${BRANCH}`;
-  const logged = await git(dir, ['reflog', 'show', '--no-abbrev', '--format=%H', ref, '--']).then(
-    (s) => s.split('\n').filter((l) => /^[0-9a-f]{40,64}$/.test(l)),
-    () => [] as string[],
+// --- Remote tips seen, per remote address ------------------------------------------------------------
+//
+// `refs/cob/seen/<hash of the address>` keeps every tip `origin/main` has had at that address reachable:
+// it is the tip itself while the remote only moves forward, and a commit with the old record and the new
+// tip as parents (on an empty tree) when the remote's history was rewritten. So a commit that was once on
+// the remote is recognised even after the host drops it (R5), without relying on the reflog (R19); it is
+// never garbage-collected (R20); and the record of one address says nothing about another (R15).
+// These refs are never pushed: every push names `main` only.
+
+const SEEN_PREFIX = 'refs/cob/seen/';
+const SEEN_IDENTITY: Record<string, string> = {
+  GIT_AUTHOR_NAME: 'company-of-bots',
+  GIT_AUTHOR_EMAIL: 'sync@company-of-bots.invalid',
+  GIT_COMMITTER_NAME: 'company-of-bots',
+  GIT_COMMITTER_EMAIL: 'sync@company-of-bots.invalid',
+};
+
+function seenRef(address: string): string {
+  return SEEN_PREFIX + createHash('sha256').update(address).digest('hex').slice(0, 32);
+}
+
+async function originAddress(dir: string): Promise<string> {
+  return (await git(dir, ['remote', 'get-url', REMOTE])).trim();
+}
+
+async function revOrNull(dir: string, rev: string): Promise<string | null> {
+  return git(dir, ['rev-parse', '--verify', '-q', rev]).then(
+    (s) => s.trim() || null,
+    () => null,
   );
-  const tips = new Set([...(before ? [before] : []), ...logged]);
-  // Only commits that still exist can be excluded (old reflog entries may point at pruned objects).
-  const exist = await run(dir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input: `${[...tips].join('\n')}\n` });
-  return exist
-    .split('\n')
-    .map((l) => l.split(' '))
-    .filter(([, type]) => type === 'commit')
-    .map(([sha]) => sha!);
+}
+
+/** Add `tip` to what this checkout has seen on `origin/main` at `address`. */
+async function recordSeen(dir: string, address: string, tip: string): Promise<void> {
+  const ref = seenRef(address);
+  const old = await revOrNull(dir, ref);
+  if (old === null) {
+    await git(dir, ['update-ref', ref, tip, ZERO_SHA]);
+    return;
+  }
+  if (old === tip || (await isAncestor(dir, tip, old))) return;
+  if (await isAncestor(dir, old, tip)) {
+    await git(dir, ['update-ref', ref, tip, old]);
+    return;
+  }
+  const emptyTree = (await run(dir, ['mktree'], { input: '' })).trim();
+  const both = (
+    await run(dir, ['commit-tree', emptyTree, '-p', old, '-p', tip, '-F', '-'], {
+      input: 'cob: tips seen on origin/main\n',
+      env: SEEN_IDENTITY,
+    })
+  ).trim();
+  await git(dir, ['update-ref', ref, both, old]);
 }
 
 /**
- * Make local main contain the remote's main. The remote's history wins for anything that was ever pushed:
- * only local commits never seen on `origin/main` are replayed, path by path, on top of the remote's tip;
- * commits that were on the remote once and are gone from it now (a history rewrite on the git host) are
- * dropped. The merge is built from git objects only; the working tree is then moved with `reset --keep`.
- * If the user changed (or deleted) a file the move would touch, it returns 'busy' and changes nothing.
+ * Make local main contain the remote's main. The remote's history wins for anything that was ever on it at
+ * this address: only local commits never seen there are replayed, path by path, on top of the remote's tip;
+ * commits that were on the remote once and are gone from it now (a rewrite on the git host) are dropped
+ * from `main` (they stay reachable under the seen ref). The merge is built from git objects only; the
+ * working tree is then moved with `reset --keep`. If the user changed (or deleted) a file the move would
+ * touch, it returns 'busy' and changes nothing.
  */
 async function integrate(
   dir: string,
@@ -1237,21 +1129,19 @@ async function integrate(
   writer: Writer,
   resolved: Set<string>,
   rewrites: Map<string, string | null>,
-  before: string | null,
+  remote: { address: string; tip: string },
 ): Promise<Integration> {
   const local = (await git(dir, ['rev-parse', 'HEAD'])).trim();
-  const upstream = (await git(dir, ['rev-parse', `refs/remotes/${REMOTE}/${BRANCH}`])).trim();
+  const upstream = remote.tip;
   if (local === upstream) return 'done';
-  const tips = [upstream, ...(await knownRemoteTips(dir, before))];
+  const seen = await revOrNull(dir, seenRef(remote.address));
+  const tips = [upstream, ...(seen ? [seen] : [])];
   const listed = await run(dir, ['rev-list', '--reverse', '--first-parent', '--stdin'], {
     input: `${local}\n${tips.map((t) => `^${t}`).join('\n')}\n`,
   });
   let target = upstream;
   for (const c of listed.split('\n').filter(Boolean)) {
-    const parent = await git(dir, ['rev-parse', '--verify', '-q', `${c}^`]).then(
-      (s) => s.trim(),
-      () => '',
-    );
+    const parent = await revOrNull(dir, `${c}^`);
     if (!parent) throw new GitError('This data repo and its remote have no history in common; nothing was synced.');
     if (parent === target) {
       target = c; // already on top: keep the commit as it is
@@ -1306,29 +1196,55 @@ async function survivor(dir: string, made: Made, rewrites: Map<string, string | 
 
 type Progress = { resolved: Set<string>; rewrites: Map<string, string | null>; made: Made[] };
 
-/** The remote's state after a fetch: its tip, or null when it has no `main` yet (nothing was ever pushed). */
-type RemoteState = { tip: string | null };
+/** The remote after a fetch: its address, and its tip, or null when it has no `main` yet (a first push). */
+type RemoteState = { address: string; tip: string | null };
+
+/** The remote is not one this checkout can sync with (R15, R17). Nothing was changed. */
+class RemoteRefused extends GitError {}
 
 const NO_REMOTE_MAIN = /couldn't find remote ref/i;
 
+/**
+ * Fetch the remote's `main` without touching any ref, then check it before anything changes:
+ * - no `main`, though this checkout has had one from this address: refused (R17);
+ * - a `main` sharing no commit with local `main` (a different repository): refused (R15).
+ * Only then is `origin/main` moved and the tip recorded as seen.
+ */
 async function fetchRemote(dir: string): Promise<RemoteState> {
+  const address = await originAddress(dir);
+  let tip: string | null;
   try {
-    await git(dir, ['fetch', '-q', REMOTE, BRANCH]);
+    await git(dir, ['fetch', '-q', '--refmap=', REMOTE, `refs/heads/${BRANCH}`]);
+    tip = (await git(dir, ['rev-parse', '--verify', '-q', 'FETCH_HEAD^{commit}'])).trim();
   } catch (err) {
-    if (err instanceof GitError && NO_REMOTE_MAIN.test(err.stderr)) return { tip: null };
-    throw err;
+    if (!(err instanceof GitError) || !NO_REMOTE_MAIN.test(err.stderr)) throw err;
+    tip = null;
   }
-  return { tip: (await git(dir, ['rev-parse', `refs/remotes/${REMOTE}/${BRANCH}`])).trim() };
-}
-
-async function trackingTip(dir: string): Promise<string | null> {
-  return git(dir, ['rev-parse', '--verify', '-q', `refs/remotes/${REMOTE}/${BRANCH}`]).then(
-    (s) => s.trim() || null,
-    () => null,
+  if (tip === null) {
+    if ((await revOrNull(dir, seenRef(address))) !== null) {
+      throw new RemoteRefused(
+        `The remote's ${BRANCH} branch is gone (it was deleted, or the repo was recreated on the git host), so nothing ` +
+          'was synced and nothing was pushed. Your data is still here. To upload it again, set up the remote again.',
+      );
+    }
+    return { address, tip: null };
+  }
+  const base = await git(dir, ['merge-base', 'HEAD', tip]).then(
+    (s) => s.trim(),
+    () => '',
   );
+  if (!base) {
+    throw new RemoteRefused(
+      `This data repo and the remote at ${address} have no history in common (is it the right repository?); ` +
+        'nothing was synced and nothing was changed.',
+    );
+  }
+  await git(dir, ['update-ref', '-m', 'cob: fetch', `refs/remotes/${REMOTE}/${BRANCH}`, tip]);
+  await recordSeen(dir, address, tip);
+  return { address, tip };
 }
 
-/** Commit what changed, fetch, and integrate; repeat if files kept changing under us. */
+/** Fetch, commit what changed, and integrate; repeat if files kept changing under us. */
 async function settle(
   dir: string,
   gitDir: string,
@@ -1338,13 +1254,23 @@ async function settle(
   opts: SyncOptions,
 ): Promise<RemoteState> {
   for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
+    let remote: RemoteState;
+    try {
+      remote = await fetchRemote(dir);
+    } catch (err) {
+      // An unreachable remote: local changes are still committed, so they are safe. A refused remote: nothing changes.
+      if (cycle === 0 && !(err instanceof RemoteRefused)) {
+        const made = await stageAndCommit(dir, message);
+        if (made) p.made.push(made);
+      }
+      throw err;
+    }
     const made = await stageAndCommit(dir, message);
     if (made) p.made.push(made);
-    const before = await trackingTip(dir);
-    const remote = await fetchRemote(dir);
     await opts.beforeIntegrate?.();
     if (remote.tip === null) return remote; // nothing on the remote yet: nothing to bring in
-    if ((await integrate(dir, gitDir, writer, p.resolved, p.rewrites, before)) === 'done') return remote;
+    const r = await integrate(dir, gitDir, writer, p.resolved, p.rewrites, { address: remote.address, tip: remote.tip });
+    if (r === 'done') return remote;
   }
   throw new GitError('Files in the data repo kept changing while syncing. Nothing was lost; try again.');
 }
@@ -1377,7 +1303,8 @@ const LOCK_RACE = /cannot lock ref|failed to update ref/;
  * Commit local changes with `message`, pull with owner-wins conflict resolution, and push.
  * When the remote moves between pull and push, pull and push again, up to `maxAttempts` times;
  * then give up with `pushed: false` (the commit stays local and goes out on the next sync).
- * Any other push failure is a `GitError`. A remote with no `main` yet gets its first push.
+ * Any other push failure is a `GitError`. A remote with no `main` gets a first push only if this
+ * checkout never had `main` from that address (R2, R17).
  */
 export async function syncRepo(dir: string, writer: Writer, message: string, opts: SyncOptions = {}): Promise<SyncResult> {
   const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? DEFAULT_ATTEMPTS));
@@ -1397,6 +1324,7 @@ export async function syncRepo(dir: string, writer: Writer, message: string, opt
       try {
         await git(dir, ['push', ...(remote.tip === null ? ['-u'] : []), REMOTE, `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]);
         pushed = true;
+        await recordSeen(dir, remote.address, head);
       } catch (err) {
         if (!(err instanceof GitError)) throw err;
         if (NON_FAST_FORWARD.test(err.stderr)) lastRace = null;
