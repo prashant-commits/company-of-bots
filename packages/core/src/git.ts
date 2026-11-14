@@ -15,7 +15,10 @@ export type GitIdentity = { name: string; email: string };
 export type SyncResult = {
   /** Sha of the commit made from local changes, as it stands in HEAD's history; null if none survived. */
   committed: string | null;
-  /** True when the remote branch equals local HEAD after the call. `pullRepo` never pushes and reports false. */
+  /**
+   * `syncRepo`: true when the remote branch equals local HEAD after the call. `pullRepo`: true only when it
+   * restored the host (`restoreHost`), the one push it makes; otherwise it never pushes and reports false.
+   */
   pushed: boolean;
   /** Paths settled by the owner-wins rule, each once, sorted. */
   resolved: string[];
@@ -1760,15 +1763,16 @@ const sorted = (set: Set<string>) => [...set].map(display).sort();
 
 /**
  * Commit local changes as `sync: local changes before pull`, then pull with owner-wins conflict resolution.
- * Never pushes. A host rewind is `HostRewoundError` unless `opts.acceptRewind` (see `syncRepo`).
+ * A host rewind is `HostRewoundError` unless `opts.acceptRewind` or `opts.restoreHost` (see `syncRepo`). It never
+ * pushes, except that with `restoreHost` it pushes the restore and only the restore: local `main` as it was when
+ * the call began. Local work it commits in the same call stays local; `pushed` is then true.
  */
 export async function pullRepo(dir: string, writer: Writer, opts: PullOptions = {}): Promise<SyncResult> {
   return guarded(dir, async (gitDir) => {
     const p = newProgress();
-    const remote = await settle(dir, gitDir, writer, 'sync: local changes before pull', p, opts);
-    // pullRepo pushes only to restore the host (`restoreHost`); `pushed` then says whether the host equals HEAD.
-    const head = (await git(dir, ['rev-parse', 'HEAD'])).trim();
-    const pushed = p.restoredTo !== null && remote.tip === head;
+    await settle(dir, gitDir, writer, 'sync: local changes before pull', p, opts);
+    // pullRepo pushes only to restore the host (`restoreHost`): `pushed` says whether it did (H3).
+    const pushed = p.restoredTo !== null;
     return { committed: await lastSurvivor(dir, p), pushed, resolved: sorted(p.resolved), rewound: rewoundOf(p) };
   });
 }

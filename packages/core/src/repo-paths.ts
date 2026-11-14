@@ -247,12 +247,14 @@ export function withoutLocalPaths(repoDir: string, text: string): string {
   }
   let out = text;
   // The folder's path only where it stands on its own: not inside a longer path (`/x/data/app`), and not as the
-  // prefix of a sibling (`/data/app2` when the folder is `/data/app`) (G10).
-  const before = `(?<![\\w.~/\\\\-])`;
+  // prefix of a sibling (`/data/app2`, `/data/app.bak` when the folder is `/data/app`) (G10). A `file://` in front
+  // goes with it, and a sentence's closing `.` after it is not a sibling (H2).
+  const before = `(?<![\\w.~/\\\\-])(?:file://)?`;
+  const after = `(?=$|[\\s'"\`:,;)\\]]|\\.(?![^\\s'"\`)\\]]))`;
   for (const root of [...roots].sort((a, b) => b.length - a.length)) {
     const inside = new RegExp(`${before}${escapeRegExp(root)}[\\\\/]([^\\s'"\`]*)`, 'g');
     out = out.replace(inside, (_m, rest: string) => rest.replace(/\\/g, '/'));
-    out = out.replace(new RegExp(`${before}${escapeRegExp(root)}(?![^\\s'"\`:,;)\\]])`, 'g'), '.');
+    out = out.replace(new RegExp(`${before}${escapeRegExp(root)}${after}`, 'g'), '.');
   }
   return out;
 }

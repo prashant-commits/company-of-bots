@@ -28,7 +28,8 @@ export function roleIdFor(link: string): string {
     .sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0));
   const query = new URLSearchParams(params).toString();
   const path = url.pathname.replace(/\/$/, '');
-  const route = /^#[/!]/.test(url.hash) ? url.hash : '';
+  // A trailing slash on a route is not part of its name (`#/job/101/` is `#/job/101`), as for the path (H1).
+  const route = /^#[/!]/.test(url.hash) ? url.hash.replace(/\/+$/, '').replace(/^#!?$/, '') : '';
   const canonical = `${url.protocol}//${url.host.toLowerCase()}${path}${query ? `?${query}` : ''}${route}`;
   return `r-${createHash('sha256').update(canonical).digest('hex').slice(0, 16)}`;
 }
