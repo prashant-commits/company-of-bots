@@ -46,11 +46,15 @@ const BASE_FLAGS = [
   'commit.gpgsign=false',
   '-c',
   `core.hooksPath=${os.devNull}`,
-  // No line-ending or attribute conversion from the user's config: files are committed and written byte for byte.
-  '-c',
-  'core.autocrlf=false',
-  '-c',
-  `core.attributesFile=${os.devNull}`,
+];
+/**
+ * Set in the local config of every checkout core makes (init and clone): no line-ending or attribute
+ * conversion from the user's global config, so files are committed and written byte for byte (R16).
+ * A checkout the user's own git made keeps the conversion it was written with (R24).
+ */
+const BYTE_EXACT_CONFIG: [string, string][] = [
+  ['core.autocrlf', 'false'],
+  ['core.attributesFile', os.devNull],
 ];
 /**
  * Env on every call: never prompt (the process is unattended), never open an editor,
@@ -484,6 +488,10 @@ function assertRemoteString(remote: string): void {
   if (remote.startsWith('-')) throw new GitError('That remote address is not valid: it starts with a dash.');
 }
 
+async function setByteExact(dir: string): Promise<void> {
+  for (const [key, value] of BYTE_EXACT_CONFIG) await git(dir, ['config', key, value]);
+}
+
 async function setIdentity(dir: string, identity: GitIdentity): Promise<void> {
   await git(dir, ['config', 'user.name', identity.name]);
   await git(dir, ['config', 'user.email', identity.email]);
@@ -702,13 +710,16 @@ export async function initPrivateRepo(dir: string, opts: { identity: GitIdentity
     fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
     writeInitMarker(path.join(dir, '.git'), null);
     await git(dir, ['init', '-q', '-b', BRANCH]);
+    await setByteExact(dir);
     await setIdentity(dir, opts.identity);
     const gitDir = (await git(dir, ['rev-parse', '--absolute-git-dir'])).trim();
     await commitLayout(dir, gitDir, layoutFiles(gitDir));
   } else if (target.kind === 'uncommitted') {
+    await setByteExact(dir);
     await setIdentity(dir, opts.identity);
     await commitLayout(dir, target.gitDir, target.layout);
   } else {
+    await setByteExact(dir);
     await setIdentity(dir, opts.identity);
   }
 
@@ -735,7 +746,8 @@ export async function cloneDataRepo(remote: string, dir: string, identity: GitId
   assertIdentity(identity);
   assertRemoteString(remote);
   const target = path.resolve(dir);
-  await git(process.cwd(), ['clone', '-q', '--branch', BRANCH, '--', remote, target]);
+  const config = BYTE_EXACT_CONFIG.flatMap(([key, value]) => ['--config', `${key}=${value}`]);
+  await git(process.cwd(), ['clone', '-q', ...config, '--branch', BRANCH, '--', remote, target]);
   await assertTopLevel(target);
   await setIdentity(target, identity);
   const tip = (await git(target, ['rev-parse', '--verify', '-q', `refs/remotes/${REMOTE}/${BRANCH}`]).catch(() => '')).trim();
@@ -876,6 +888,15 @@ async function assertNoOperation(dir: string): Promise<void> {
     throw new GitError(
       `${name} started with git is still in progress in this data repo, so nothing was synced and nothing was changed. ` +
         `Finish it with ${finish}, then sync again.`,
+    );
+  }
+  // A conflict with no operation behind it (`git stash pop`, `git checkout -m`): its markers must not be committed.
+  const unmerged = [...new Set(splitZ(await run(dir, ['ls-files', '-u', '-z'], { latin1: true })).map((e) => e.replace(/^[^\t]*\t/, '')))];
+  if (unmerged.length > 0) {
+    throw new GitError(
+      `Files in this data repo have unresolved conflicts (${unmerged.map(display).join(', ')}), left for example by ` +
+        '`git stash pop` or `git checkout -m`, so nothing was synced and nothing was changed. Resolve each file and ' +
+        '`git add` it (or `git checkout HEAD -- <file>` to drop the conflict), then sync again.',
     );
   }
 }
@@ -1077,12 +1098,81 @@ const SEEN_IDENTITY: Record<string, string> = {
   GIT_COMMITTER_EMAIL: 'sync@company-of-bots.invalid',
 };
 
+/**
+ * The repository an address names, for the seen record (R25): host (lower case, without user info or port)
+ * and path (without trailing slashes or a `.git` suffix). The https, ssh and scp-like (`user@host:path`)
+ * forms of one host and path are one repository; so are a local path and its `file://` URL.
+ */
+function repositoryKey(address: string): string {
+  const a = address.trim();
+  let host = '';
+  let p: string;
+  const url = /^([a-z][a-z0-9+.-]*):\/\/([^/]*)(.*)$/i.exec(a);
+  const scp = /^(?:[^@/]+@)?([^:/\\]{2,}):(?!\/\/)(.*)$/.exec(a);
+  if (url) {
+    const authority = url[2]!;
+    host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '').toLowerCase();
+    p = url[3] || '/';
+    if (url[1]!.toLowerCase() === 'file') {
+      try {
+        p = decodeURIComponent(p);
+      } catch {
+        // keep it as written
+      }
+    }
+  } else if (scp) {
+    host = scp[1]!.toLowerCase();
+    p = `/${scp[2]!.replace(/^\/+/, '')}`;
+  } else {
+    p = path.resolve(a);
+  }
+  p = p.replace(/\/{2,}/g, '/').replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/+$/, '');
+  return `${host}\n${p}`;
+}
+
 function seenRef(address: string): string {
+  return SEEN_PREFIX + createHash('sha256').update(repositoryKey(address)).digest('hex').slice(0, 32);
+}
+
+/** The record name be6b77c used (keyed on the raw address), so such a record carries over. */
+function legacySeenRef(address: string): string {
   return SEEN_PREFIX + createHash('sha256').update(address).digest('hex').slice(0, 32);
 }
 
+/** `origin`'s address as configured (its first URL). Throws `GitError` if there is no `origin`. */
 async function originAddress(dir: string): Promise<string> {
-  return (await git(dir, ['remote', 'get-url', REMOTE])).trim();
+  const expanded = (await git(dir, ['remote', 'get-url', REMOTE])).trim();
+  const raw = await git(dir, ['config', '--get-all', `remote.${REMOTE}.url`]).then(
+    (s) => s.split('\n')[0]!.trim(),
+    () => '',
+  );
+  return raw || expanded;
+}
+
+/**
+ * Tips that count as seen at `address` although its record does not exist yet (R23). Read-only: the caller
+ * records them once the fetch is accepted.
+ * - A record made under be6b77c's raw-address name carries over.
+ * - A checkout with no record at all (the user's own clone, older code, `refs/cob/` removed) counts the
+ *   tracking ref's tip and the tips in its reflog, read before anything moves that ref.
+ * A checkout that has a record for another address gets nothing from the tracking ref (R15).
+ */
+async function seedTips(dir: string, address: string): Promise<string[]> {
+  if ((await revOrNull(dir, seenRef(address))) !== null) return [];
+  const legacy = await revOrNull(dir, legacySeenRef(address));
+  if (legacy !== null) return [legacy];
+  if ((await git(dir, ['for-each-ref', '--count=1', '--format=%(refname)', SEEN_PREFIX])).trim()) return [];
+  const tracking = `refs/remotes/${REMOTE}/${BRANCH}`;
+  const tip = await revOrNull(dir, tracking);
+  if (tip === null) return [];
+  const logged = await git(dir, ['reflog', 'show', '--no-abbrev', '--format=%H', tracking, '--']).then(
+    (s) => s.split('\n').filter((l) => /^[0-9a-f]{40,64}$/.test(l)),
+    () => [] as string[],
+  );
+  const candidates = [...new Set([...logged.reverse(), tip])];
+  const types = await run(dir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input: `${candidates.join('\n')}\n` });
+  const commits = new Set(types.split('\n').filter((l) => l.endsWith(' commit')).map((l) => l.split(' ')[0]!));
+  return candidates.filter((c) => commits.has(c));
 }
 
 async function revOrNull(dir: string, rev: string): Promise<string | null> {
@@ -1212,6 +1302,7 @@ const NO_REMOTE_MAIN = /couldn't find remote ref/i;
  */
 async function fetchRemote(dir: string): Promise<RemoteState> {
   const address = await originAddress(dir);
+  const seeds = await seedTips(dir, address);
   let tip: string | null;
   try {
     await git(dir, ['fetch', '-q', '--refmap=', REMOTE, `refs/heads/${BRANCH}`]);
@@ -1221,7 +1312,7 @@ async function fetchRemote(dir: string): Promise<RemoteState> {
     tip = null;
   }
   if (tip === null) {
-    if ((await revOrNull(dir, seenRef(address))) !== null) {
+    if (seeds.length > 0 || (await revOrNull(dir, seenRef(address))) !== null) {
       throw new RemoteRefused(
         `The remote's ${BRANCH} branch is gone (it was deleted, or the repo was recreated on the git host), so nothing ` +
           'was synced and nothing was pushed. Your data is still here. To upload it again, set up the remote again.',
@@ -1235,10 +1326,11 @@ async function fetchRemote(dir: string): Promise<RemoteState> {
   );
   if (!base) {
     throw new RemoteRefused(
-      `This data repo and the remote at ${address} have no history in common (is it the right repository?); ` +
+      `This data repo and the remote at ${redact(address)} have no history in common (is it the right repository?); ` +
         'nothing was synced and nothing was changed.',
     );
   }
+  for (const seed of seeds) await recordSeen(dir, address, seed);
   await git(dir, ['update-ref', '-m', 'cob: fetch', `refs/remotes/${REMOTE}/${BRANCH}`, tip]);
   await recordSeen(dir, address, tip);
   return { address, tip };

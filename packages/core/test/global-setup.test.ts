@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { expect, test } from 'vitest';
-import { sweepEndedRuns } from './global-setup.ts';
+import setup, { sweepEndedRuns } from './global-setup.ts';
 import { tmpDir } from './helpers.ts';
 
 test('R21 the next run removes folders of runs that have ended, and never the folder of a run still going', () => {
@@ -28,3 +28,33 @@ test('R21 the next run removes folders of runs that have ended, and never the fo
   expect(fs.existsSync(justStarted)).toBe(true);
   expect(fs.existsSync(unrelated)).toBe(true);
 });
+
+test.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)(
+  'R21 a folder the sweep cannot remove is skipped, and the run still starts',
+  () => {
+    const root = tmpDir();
+    const deadPid = Number(execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).toString());
+    const stuck = path.join(root, 'cob-run-stuck');
+    fs.mkdirSync(path.join(stuck, 'locked'), { recursive: true });
+    fs.writeFileSync(path.join(stuck, 'locked', 'f'), 'x');
+    fs.writeFileSync(path.join(stuck, 'cob-run-owner.json'), JSON.stringify({ pid: deadPid }));
+    const ended = path.join(root, 'cob-run-ended');
+    fs.mkdirSync(ended);
+    fs.writeFileSync(path.join(ended, 'cob-run-owner.json'), JSON.stringify({ pid: deadPid }));
+    fs.chmodSync(path.join(stuck, 'locked'), 0o500);
+    const previous = process.env.TMPDIR;
+    try {
+      expect(sweepEndedRuns(root)).toEqual(['cob-run-ended']);
+      expect(fs.existsSync(stuck)).toBe(true);
+      process.env.TMPDIR = root;
+      const teardown = setup(); // starts despite the folder it cannot remove
+      expect(process.env.TMPDIR).toMatch(/cob-run-/);
+      teardown();
+      expect(process.env.TMPDIR).toBe(root);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+      fs.chmodSync(path.join(stuck, 'locked'), 0o700);
+    }
+  },
+);

@@ -19,7 +19,7 @@ function alive(pid: number): boolean {
 /**
  * Remove `cob-run-*` folders under `root` left by test runs that have ended (interrupted by SIGINT, SIGTERM
  * or a kill, so their teardown never ran). A folder whose run process is still alive is never touched,
- * so two overlapping runs are safe.
+ * so two overlapping runs are safe. A folder that cannot be read or removed is skipped.
  */
 export function sweepEndedRuns(root: string, now = Date.now()): string[] {
   const removed: string[] = [];
@@ -43,9 +43,12 @@ export function sweepEndedRuns(root: string, now = Date.now()): string[] {
         continue;
       }
     }
-    if (ended) {
+    if (!ended) continue;
+    try {
       fs.rmSync(dir, { recursive: true, force: true });
       removed.push(name);
+    } catch {
+      // Cannot read or remove it (another user's, or read-only): skip it. The sweep never stops a run.
     }
   }
   return removed;
@@ -55,7 +58,11 @@ export function sweepEndedRuns(root: string, now = Date.now()): string[] {
 export default function setup(): () => void {
   const previous = process.env.TMPDIR;
   const base = os.tmpdir();
-  sweepEndedRuns(base);
+  try {
+    sweepEndedRuns(base);
+  } catch {
+    // never let the sweep stop the run from starting
+  }
   const root = fs.mkdtempSync(path.join(base, 'cob-run-'));
   fs.writeFileSync(path.join(root, OWNER), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
   process.env.TMPDIR = root;

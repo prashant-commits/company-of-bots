@@ -1596,7 +1596,7 @@ function snapshot(dir: string) {
  * fetched (the remote is moved first, and the tracking ref must not follow), committed or pushed, and the
  * checkout is byte for byte as it was.
  */
-async function expectRefused(dir: string, writer: 'app' | 'agent', name: RegExp): Promise<void> {
+async function expectRefused(dir: string, writer: 'app' | 'agent', name: RegExp, how: RegExp = /--abort/): Promise<void> {
   const other = dir === appDir ? agentDir : appDir;
   write(other, `moved-${Date.now()}.txt`, 'the remote moved\n');
   await syncRepo(other, writer === 'app' ? 'agent' : 'app', 'remote moves on');
@@ -1606,7 +1606,7 @@ async function expectRefused(dir: string, writer: 'app' | 'agent', name: RegExp)
     const err = (await call().catch((e: unknown) => e)) as GitError;
     expect(err).toBeInstanceOf(GitError);
     expect(err.message).toMatch(name);
-    expect(err.message).toMatch(/--abort/);
+    expect(err.message).toMatch(how);
   }
   expect(snapshot(dir)).toEqual(before);
   expect(sh(remote, 'for-each-ref')).toBe(remoteBefore);
@@ -1978,4 +1978,233 @@ test('R22 an init marker whose commit is not the root of HEAD (an amended init c
   fs.unlinkSync(path.join(r2, 'hooks', 'pre-receive'));
   await expect(initPrivateRepo(dir, { identity, remote: r2 })).rejects.toBeInstanceOf(GitError);
   expect(sh(r2, 'for-each-ref')).toBe('');
+}, T);
+
+// ===========================================================================
+// cob-d2 fix 2 (rows R23-R25, amended R13, R21, R22)
+// ===========================================================================
+
+/** Remove every record under refs/cob/: a checkout made by older code, or with the records deleted. */
+function removeRecords(dir: string): void {
+  for (const ref of sh(dir, 'for-each-ref', '--format=%(refname)', 'refs/cob/').split('\n').filter(Boolean)) {
+    sh(dir, 'update-ref', '-d', ref);
+  }
+  expect(sh(dir, 'for-each-ref', 'refs/cob/')).toBe('');
+}
+
+// --- R23: a checkout with no record counts its tracking ref as seen ------------------------------------
+
+test('R23 no record, reflog intact: a host rewind is followed and the dropped commit is not replayed', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  removeRecords(appDir);
+  rewindRemote();
+  expect((await syncRepo(appDir, 'app', 'sync')).pushed).toBe(true);
+  expect(remoteHistory()).not.toContain('transcript');
+  expect(sh(remote, 'log', '--format=%s', 'main')).not.toContain('transcript');
+  expect(exists(appDir, 'notes/transcript.txt')).toBe(false);
+}, T);
+
+test('R23 no record, reflog intact: a deleted main is GitError (R17), nothing is pushed and nothing changes', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  removeRecords(appDir);
+  sh(remote, 'update-ref', '-d', 'refs/heads/main');
+  await expectMainGone(appDir);
+}, T);
+
+test('R23 no record and no reflog: the tracking tip alone is enough, for a rewind and for a deleted main', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  removeRecords(appDir);
+  fs.rmSync(path.join(appDir, '.git', 'logs'), { recursive: true, force: true });
+  rewindRemote();
+  expect((await syncRepo(appDir, 'app', 'sync')).pushed).toBe(true);
+  expect(remoteHistory()).not.toContain('transcript');
+  removeRecords(appDir);
+  fs.rmSync(path.join(appDir, '.git', 'logs'), { recursive: true, force: true });
+  sh(remote, 'update-ref', '-d', 'refs/heads/main');
+  await expectMainGone(appDir);
+}, T);
+
+test('R23 a checkout made by the user’s own `git clone` follows a host rewind', async () => {
+  write(appDir, 'notes/transcript.txt', 'SECRET-TRANSCRIPT\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  const own = path.join(tmpDir(), 'own');
+  execFileSync('git', ['clone', '-q', remote, own]);
+  sh(own, 'config', 'user.name', 'Own');
+  sh(own, 'config', 'user.email', 'own@example.com');
+  rewindRemote();
+  write(own, 'work.txt', 'work\n');
+  expect((await syncRepo(own, 'agent', 'work')).pushed).toBe(true);
+  expect(remoteHistory()).not.toContain('transcript');
+  expect(remoteTree()).toContain('work.txt');
+}, T);
+
+test('R23 a checkout with a record for another address gets nothing from the tracking ref (R15 holds)', async () => {
+  const copy = path.join(tmpDir(), 'copy.git');
+  execFileSync('git', ['clone', '-q', '--bare', remote, copy]);
+  write(appDir, 'a.txt', 'a\n');
+  await syncRepo(appDir, 'app', 'a'); // the tracking ref now holds a commit the copy has never had
+  sh(appDir, 'remote', 'set-url', 'origin', copy);
+  write(appDir, 'b.txt', 'b\n');
+  expect((await syncRepo(appDir, 'app', 'b')).pushed).toBe(true);
+  expect(sh(copy, 'rev-parse', 'main')).toBe(sh(appDir, 'rev-parse', 'HEAD'));
+  expect(exists(appDir, 'a.txt')).toBe(true);
+  expect(sh(copy, 'ls-tree', '-r', '--name-only', 'main')).toMatch(/^a\.txt$/m);
+  clean(appDir);
+}, T);
+
+// --- R13 (amended): unmerged entries with no operation behind them -------------------------------------
+
+test('R13 a conflict left by `git stash pop` is refused and left as it is', async () => {
+  write(appDir, 'notes.txt', 'base\n');
+  await syncRepo(appDir, 'app', 'base');
+  write(appDir, 'notes.txt', 'STASHED EDIT\n');
+  sh(appDir, 'stash', '-q');
+  write(appDir, 'notes.txt', 'APP-SIDE 2\n');
+  sh(appDir, 'commit', '-q', '-am', 'app 2');
+  shTry(appDir, {}, 'stash', 'pop');
+  expect(sh(appDir, 'ls-files', '-u')).not.toBe('');
+  await expectRefused(appDir, 'app', /unresolved conflicts \(notes\.txt\)/, /git add/);
+  expect(read(appDir, 'notes.txt')).toContain('<<<<<<<');
+  expect(sh(remote, 'log', '-p', 'main')).not.toContain('<<<<<<<');
+}, T);
+
+test('R13 a conflict left by `git checkout -m` is refused and left as it is', async () => {
+  write(appDir, 'notes.txt', 'base\n');
+  await syncRepo(appDir, 'app', 'base');
+  sh(appDir, 'checkout', '-q', '-b', 'side');
+  write(appDir, 'notes.txt', 'SIDE\n');
+  sh(appDir, 'commit', '-q', '-am', 'side');
+  write(appDir, 'notes.txt', 'LOCAL EDIT\n');
+  shTry(appDir, {}, 'checkout', '-q', '-m', 'main');
+  expect(sh(appDir, 'symbolic-ref', 'HEAD').trim()).toBe('refs/heads/main');
+  expect(sh(appDir, 'ls-files', '-u')).not.toBe('');
+  await expectRefused(appDir, 'app', /unresolved conflicts \(notes\.txt\)/, /git add/);
+  expect(sh(remote, 'log', '-p', 'main')).not.toContain('<<<<<<<');
+}, T);
+
+// --- R24: a checkout the user's own git wrote with CRLF ----------------------------------------------------
+
+test('R24 a checkout written by the user’s own git under core.autocrlf=true: no change commits nothing; one write commits one file', async () => {
+  write(appDir, 'notes.txt', 'one\ntwo\n');
+  await syncRepo(appDir, 'app', 'notes');
+  await withEnv(globalConfig('[core]\n\tautocrlf = true\n'), async () => {
+    const own = path.join(tmpDir(), 'own');
+    execFileSync('git', ['clone', '-q', remote, own]);
+    sh(own, 'config', 'user.name', 'Own');
+    sh(own, 'config', 'user.email', 'own@example.com');
+    expect(fs.readFileSync(path.join(own, 'notes.txt'), 'utf8')).toBe('one\r\ntwo\r\n');
+    const before = sh(remote, 'rev-parse', 'main');
+    expect(await syncRepo(own, 'agent', 'nothing')).toMatchObject({ committed: null, pushed: true });
+    expect(sh(remote, 'rev-parse', 'main')).toBe(before);
+    new DataRepo(own, 'agent').put('application', sample.application({ id: 'a1' }));
+    const r = await syncRepo(own, 'agent', 'one record');
+    expect(r.pushed).toBe(true);
+    expect(sh(own, 'show', '--name-only', '--format=', r.committed!)).toBe('applications/a1.json\n');
+    expect(remoteFile('notes.txt')).toBe('one\ntwo\n');
+    expect(Buffer.from(execFileSync('git', ['cat-file', 'blob', 'main:applications/a1.json'], { cwd: remote }))).toEqual(
+      fs.readFileSync(path.join(own, 'applications/a1.json')),
+    );
+  });
+}, T);
+
+// --- R25: one record per repository, however its address is spelled ------------------------------------
+
+/** Push a new private file, re-spell origin, scrub that commit on the host, sync: the scrub must hold. */
+async function scrubAfterRespelling(spelling: string, n: number): Promise<void> {
+  write(appDir, `notes/transcript-${n}.txt`, 'private\n');
+  await syncRepo(appDir, 'app', `transcript ${n}`);
+  sh(appDir, 'remote', 'set-url', 'origin', spelling);
+  rewindRemote();
+  expect((await syncRepo(appDir, 'app', `after ${n}`)).pushed).toBe(true);
+  expect(remoteHistory()).not.toContain(`transcript-${n}`);
+}
+
+test('R25 local respellings (trailing slash, file://, no .git suffix) keep one record: a scrub stays scrubbed, a deleted main stays deleted', async () => {
+  const spellings = [`${remote}/`, `file://${remote}`, remote.replace(/\.git$/, ''), `file://${remote}/`];
+  let n = 0;
+  for (const spelling of spellings) await scrubAfterRespelling(spelling, ++n);
+  sh(appDir, 'remote', 'set-url', 'origin', remote);
+  sh(remote, 'update-ref', '-d', 'refs/heads/main');
+  await expectMainGone(appDir);
+}, T);
+
+test('R25 a rotated token, another user name, host case, and https against ssh keep one record', async () => {
+  const spellings = [
+    'https://tok1@example.com/me/data.git',
+    'https://tok2@example.com/me/data.git',
+    'https://someone:tok3@Example.COM/me/data.git/',
+    'https://example.com/me/data',
+    'git@example.com:me/data.git',
+    'ssh://git@example.com:22/me/data.git',
+  ];
+  // The user's git config sends each spelling to the same repository (here, the local bare remote).
+  for (const s of spellings) sh(appDir, 'config', '--add', `url.${remote}.insteadOf`, s);
+  sh(appDir, 'remote', 'set-url', 'origin', spellings[0]!);
+  write(appDir, 'first.txt', 'x\n');
+  await syncRepo(appDir, 'app', 'first under https');
+  let n = 0;
+  for (const spelling of spellings.slice(1)) await scrubAfterRespelling(spelling, ++n);
+  sh(remote, 'update-ref', '-d', 'refs/heads/main');
+  await expectMainGone(appDir);
+}, T);
+
+test('R25 a different path on the same host is a different repository: its record is not shared', async () => {
+  const copy = path.join(tmpDir(), 'copy.git');
+  execFileSync('git', ['clone', '-q', '--bare', remote, copy]);
+  sh(appDir, 'config', '--add', `url.${remote}.insteadOf`, 'https://example.com/me/data.git');
+  sh(appDir, 'config', '--add', `url.${copy}.insteadOf`, 'https://example.com/me/other.git');
+  sh(appDir, 'remote', 'set-url', 'origin', 'https://example.com/me/data.git');
+  write(appDir, 'a.txt', 'a\n');
+  await syncRepo(appDir, 'app', 'a'); // recorded for me/data only
+  sh(appDir, 'remote', 'set-url', 'origin', 'https://example.com/me/other.git');
+  write(appDir, 'b.txt', 'b\n');
+  expect((await syncRepo(appDir, 'app', 'b')).pushed).toBe(true);
+  expect(exists(appDir, 'a.txt')).toBe(true); // a shared record would count `a` as once pushed and drop it
+  expect(sh(copy, 'ls-tree', '-r', '--name-only', 'main')).toMatch(/^a\.txt$[\s\S]*^b\.txt$/m);
+  clean(appDir);
+}, T);
+
+// --- R22 (amended): the clone and init records, and a rewrite that removes a middle commit -----------------
+
+const seenRefs = (dir: string) =>
+  sh(dir, 'for-each-ref', '--format=%(objectname)', 'refs/cob/seen/').split('\n').filter(Boolean);
+
+test('R22 cloneDataRepo records the tip it cloned', async () => {
+  const dir = path.join(tmpDir(), 'c');
+  await cloneDataRepo(remote, dir, identity);
+  expect(seenRefs(dir)).toEqual([sh(dir, 'rev-parse', 'refs/remotes/origin/main').trim()]);
+}, T);
+
+test('R22 initPrivateRepo records the tip of its first push', async () => {
+  expect(seenRefs(appDir)).toEqual([sh(appDir, 'rev-parse', 'HEAD').trim()]);
+  const { dir, r2 } = await failedInit();
+  expect(seenRefs(dir)).toEqual([]);
+  fs.unlinkSync(path.join(r2, 'hooks', 'pre-receive'));
+  await initPrivateRepo(dir, { identity, remote: r2 });
+  expect(seenRefs(dir)).toEqual([sh(dir, 'rev-parse', 'HEAD').trim()]);
+}, T);
+
+test('R22 a host rewrite that removes a commit from the middle keeps every old tip: the commit is not replayed and survives gc', async () => {
+  write(appDir, 'notes/leak.txt', 'leaked\n');
+  await syncRepo(appDir, 'app', 'leak');
+  const leak = sh(appDir, 'rev-parse', 'HEAD').trim();
+  write(appDir, 'later.txt', 'later\n');
+  await syncRepo(appDir, 'app', 'later');
+  await pullRepo(agentDir, 'agent');
+  // On the host: drop the leak commit, keep the one after it (a new sha, not an ancestor move).
+  const third = thirdClone();
+  sh(third, 'rebase', '-q', '--onto', `${leak}^`, leak, 'main');
+  sh(third, 'push', '-q', '--force', 'origin', 'main');
+  for (const [dir, writer] of [[agentDir, 'agent'], [appDir, 'app']] as const) {
+    expect((await syncRepo(dir, writer, 'follow')).pushed).toBe(true);
+    expect(exists(dir, 'notes/leak.txt')).toBe(false);
+    expect(exists(dir, 'later.txt')).toBe(true);
+    sh(dir, 'reflog', 'expire', '--expire=now', '--all');
+    sh(dir, 'gc', '-q', '--prune=now');
+    expect(() => sh(dir, 'cat-file', '-e', `${leak}^{commit}`)).not.toThrow();
+  }
+  expect(remoteHistory()).not.toContain('leak.txt');
 }, T);
