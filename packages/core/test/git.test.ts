@@ -2360,8 +2360,8 @@ test('R22 cloneDataRepo makes a byte-exact checkout whatever the user’s line-e
       expect(fs.readFileSync(path.join(dir, rel)).includes(0x0d), rel).toBe(false);
     }
     const crlf = Buffer.from('a\r\nb\r\n');
-    new DataRepo(dir, 'agent').writeBlob('profile/resumes/cv.txt', new Uint8Array(crlf));
-    expect((await syncRepo(dir, 'agent', 'cv')).pushed).toBe(true);
+    new DataRepo(dir, 'app').writeBlob('profile/resumes/cv.txt', new Uint8Array(crlf));
+    expect((await syncRepo(dir, 'app', 'cv')).pushed).toBe(true);
     expect(Buffer.from(execFileSync('git', ['cat-file', 'blob', 'main:profile/resumes/cv.txt'], { cwd: remote }))).toEqual(crlf);
   });
 }, T);
