@@ -1,6 +1,6 @@
 import type { DataRepo } from './repo.ts';
 import { OwnershipError } from './repo.ts';
-import { CommandSchema, type Command } from './schema.ts';
+import { CommandSchema, type Command, type StatusKind } from './schema.ts';
 import { newId } from './ids.ts';
 
 export class CommandError extends Error {
@@ -10,23 +10,37 @@ export class CommandError extends Error {
   }
 }
 
-export type CommandInput = {
-  verb: Command['verb'];
-  target: string | null;
-  payload: Command['payload'];
-};
+type RunRole = 'finder' | 'applier' | 'guide';
+
+export type CommandInput =
+  | { verb: 'interview_saved'; target: string | null; payload: { interviewId: string } }
+  | { verb: 'retry'; target: string; payload: { notSent?: boolean; parkAt?: string } }
+  | { verb: 'done'; target: string; payload: Record<string, never> }
+  | { verb: 'verified'; target: string; payload: Record<string, never> }
+  | { verb: 'drop'; target: string; payload: { reason?: string } }
+  | { verb: 'status'; target: string; payload: { kind: StatusKind; text: string } }
+  | { verb: 'lane_done'; target: string; payload: { day: string } }
+  | { verb: 'lane_skip'; target: string; payload: { day: string } }
+  | { verb: 'run_role'; target: string | null; payload: { role: RunRole } };
+
+function applicationExists(repo: DataRepo, target: string): boolean {
+  if (!/^[A-Za-z0-9._-]+$/.test(target) || target === '.' || target === '..') {
+    return false;
+  }
+  return repo.get('application', target) !== null;
+}
 
 function validateTarget(repo: DataRepo, input: CommandInput): void {
-  const verbsNeedApp = new Set(['retry', 'done', 'drop', 'verified', 'status']);
-  const verbsNeedLane = new Set(['lane_done', 'lane_skip']);
-  const verbsNeedNull = new Set(['interview_saved', 'run_role']);
+  const verbsNeedApp = new Set(['retry', 'done', 'drop', 'verified', 'status'] as const);
+  const verbsNeedLane = new Set(['lane_done', 'lane_skip'] as const);
+  const verbsNeedNull = new Set(['interview_saved', 'run_role'] as const);
 
-  if (verbsNeedNull.has(input.verb)) {
+  if (verbsNeedNull.has(input.verb as 'interview_saved' | 'run_role')) {
     if (input.target !== null) throw new CommandError(`verb ${input.verb} requires null target`);
     return;
   }
 
-  if (verbsNeedLane.has(input.verb)) {
+  if (verbsNeedLane.has(input.verb as 'lane_done' | 'lane_skip')) {
     if (input.target === null) throw new CommandError(`verb ${input.verb} requires a lane target`);
     const lanes = repo.getSingleton('lanes');
     if (!lanes?.lanes.some((l) => l.id === input.target)) {
@@ -35,9 +49,9 @@ function validateTarget(repo: DataRepo, input: CommandInput): void {
     return;
   }
 
-  if (verbsNeedApp.has(input.verb)) {
+  if (verbsNeedApp.has(input.verb as 'retry' | 'done' | 'drop' | 'verified' | 'status')) {
     if (input.target === null) throw new CommandError(`verb ${input.verb} requires a target`);
-    if (repo.get('application', input.target) === null) {
+    if (!applicationExists(repo, input.target)) {
       throw new CommandError(`unknown application: ${input.target}`);
     }
   }

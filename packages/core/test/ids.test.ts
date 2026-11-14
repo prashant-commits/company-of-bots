@@ -27,3 +27,32 @@ test('assertSafeId accepts record ids and rejects paths', () => {
   expect(() => assertSafeId('../x')).toThrow(UnsafeNameError);
   expect(() => assertSafeId('a/b')).toThrow(UnsafeNameError);
 });
+
+test('safeFileName output is one segment that is safe on Windows, macOS and Linux (B9)', () => {
+  expect(safeFileName('C:evil.pdf')).toBe('C_evil.pdf');
+  expect(safeFileName('Resume: 2026.pdf')).toBe('Resume_ 2026.pdf');
+  expect(safeFileName('a<b>c"d|e?f*g.pdf')).toBe('a_b_c_d_e_f_g.pdf');
+  expect(safeFileName('report.pdf.')).toBe('report.pdf');
+  expect(safeFileName('report.pdf. . ')).toBe('report.pdf');
+  expect(safeFileName('CON.pdf')).toBe('_CON.pdf');
+  expect(safeFileName('nul')).toBe('_nul');
+  expect(safeFileName('Com1.txt')).toBe('_Com1.txt');
+  expect(safeFileName('lpt9')).toBe('_lpt9');
+  expect(safeFileName('console.pdf')).toBe('console.pdf');
+  expect(safeFileName('a\u0000b.pdf')).toBe('a_b.pdf');
+  expect(safeFileName('a\u001fb.pdf')).toBe('a_b.pdf');
+  expect(safeFileName('My Résumé.pdf')).toBe('My Résumé.pdf');
+  expect(() => safeFileName('...')).toThrow(UnsafeNameError);
+  expect(() => safeFileName('. . .')).toThrow(UnsafeNameError);
+});
+test('roleIdFor ignores tracking parameter names in any letter case', () => {
+  const base = roleIdFor('https://careers.example.com/jobs/42');
+  for (const q of ['UTM_source=x', 'Gclid=1', 'FBCLID=2', 'Ref=feed', 'utm_medium=email', 'utm_campaign=x']) {
+    expect(roleIdFor(`https://careers.example.com/jobs/42?${q}`)).toBe(base);
+  }
+  expect(roleIdFor('https://careers.example.com/jobs/42?id=1')).not.toBe(base);
+});
+test('assertSafeId rejects . and ..', () => {
+  expect(() => assertSafeId('.')).toThrow(UnsafeNameError);
+  expect(() => assertSafeId('..')).toThrow(UnsafeNameError);
+});

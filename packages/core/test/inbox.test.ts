@@ -4,7 +4,7 @@ import { createCommand } from '../src/commands.ts';
 import { processQueue } from '../src/process.ts';
 import { DataRepo } from '../src/repo.ts';
 import type { Application, Park } from '../src/schema.ts';
-import { pair } from './helpers.ts';
+import { pair, sample } from './helpers.ts';
 
 let app: DataRepo;
 let agent: DataRepo;
@@ -106,5 +106,45 @@ describe('inbox', () => {
     expect(rows[1]!.applicationId).toBe('old');
     expect(rows[1]!.fields).toEqual(['Salary expectations', 'Notice period']);
     expect(rows[1]!.site).toBe('site.example.com');
+  });
+
+  // L5 / B16 amended
+  test('B16 L5 row.buttons is a fresh copy and does not mutate BUTTONS', () => {
+    seedPark('k-btn', { type: 'captcha' });
+    const row = inboxRows(agent)[0]!;
+    row.buttons.reverse();
+    expect(BUTTONS.captcha).toEqual(['done', 'status', 'retry', 'drop']);
+  });
+
+  // m50 & m52 [B16]
+  test('B16 m50 m52 inboxRows sorts strictly by parkedAt descending, not application id', () => {
+    // id 'aaa' has older parkedAt, id 'zzz' has newer parkedAt
+    seedPark('aaa', { type: 'captcha', at: '2026-11-10T10:00:00.000Z' });
+    seedPark('zzz', { type: 'captcha', at: '2026-11-12T10:00:00.000Z' });
+    const rows = inboxRows(agent);
+    expect(rows.map((r) => r.applicationId)).toEqual(['zzz', 'aaa']);
+  });
+
+  // m55 [B16]
+  test('B16 m55 inboxRows excludes applications not in state parked even with non-null park', () => {
+    // Create an application with state 'submitted' but with a non-null park field
+    const appRecord = sample.application({
+      id: 'sub-with-park',
+      state: 'submitted',
+      park: { type: 'captcha', at: '2026-11-11T10:00:00.000Z' },
+    });
+    agent.put('application', appRecord);
+    const rows = inboxRows(agent);
+    expect(rows.map((r) => r.applicationId)).not.toContain('sub-with-park');
+  });
+
+  // m56 [B16]
+  test('B16 m56 pending in inboxRows only matches commands targeting that application', () => {
+    seedPark('app1', { type: 'captcha' });
+    seedPark('app2', { type: 'captcha' });
+    createCommand(app, { verb: 'drop', target: 'app2', payload: {} });
+    const rows = Object.fromEntries(inboxRows(agent).map((r) => [r.applicationId, r]));
+    expect(rows.app1!.pending).toBeNull();
+    expect(rows.app2!.pending).toBe('drop');
   });
 });

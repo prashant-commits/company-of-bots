@@ -72,7 +72,7 @@ export function ownerOfPath(relPath: string): Writer | null {
 
   for (const entry of Object.values(KINDS)) {
     const prefix = `${entry.dir}/`;
-    if (p.startsWith(prefix) && p.endsWith('.json')) {
+    if (p.startsWith(prefix)) {
       return entry.owner === 'command' ? 'agent' : entry.owner;
     }
   }
