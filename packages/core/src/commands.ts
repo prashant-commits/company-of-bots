@@ -2,6 +2,7 @@ import type { DataRepo } from './repo.ts';
 import { OwnershipError } from './repo.ts';
 import { CommandSchema, type Command, type StatusKind } from './schema.ts';
 import { newId } from './ids.ts';
+import { isSafeId } from './names.ts';
 
 export class CommandError extends Error {
   constructor(message: string) {
@@ -24,9 +25,7 @@ export type CommandInput =
   | { verb: 'run_role'; target: string | null; payload: { role: RunRole } };
 
 function applicationExists(repo: DataRepo, target: string): boolean {
-  if (!/^[A-Za-z0-9._-]+$/.test(target) || target === '.' || target === '..') {
-    return false;
-  }
+  if (!isSafeId(target)) return false;
   return repo.get('application', target) !== null;
 }
 

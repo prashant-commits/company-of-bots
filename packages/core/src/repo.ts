@@ -1,17 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { assertSafeId } from './ids.ts';
+import { UnsafeNameError, assertSafeId } from './ids.ts';
 import { KINDS, SINGLETONS, type KindName, type KindType, type SingletonName, type SingletonType, type Writer } from './layout.ts';
 import {
   assertEntryIsPlainFile,
   assertRegularFile,
   atomicWrite,
-  isTmpArtifactName,
+  lstatOrNull,
   nodeGuardFs,
   recordRelPath,
   resolveRepoPath,
   type PathOptions,
 } from './repo-paths.ts';
+import { isOsJunk, isSecretLookingPath, isTmpArtifactName } from './names.ts';
 import { RepoMetaSchema, SCHEMA_VERSION } from './schema.ts';
 import type { DayLog, Transcript } from './schema.ts';
 
@@ -43,21 +44,11 @@ const BLOB_RESUME_TEXT = /^profile\/resume-text\/([^/]+)$/;
 function assertBlobWriteDeletePath(relPath: string, writer: Writer): void {
   const match = BLOB_RESUME.exec(relPath) ?? BLOB_RESUME_TEXT.exec(relPath);
   const name = match?.[1];
-  if (!name || name === '.' || name === '..') {
+  if (!name || name === '.' || name === '..' || isOsJunk(name)) {
     throw new OwnershipError(`blob path not allowed: ${JSON.stringify(relPath)}`);
   }
   if (writer !== 'app') {
     throw new OwnershipError(`only the app may write resume blobs`);
-  }
-}
-
-function lstatOrNull(filePath: string): fs.Stats | null {
-  try {
-    return fs.lstatSync(filePath);
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
-    throw e;
   }
 }
 
@@ -252,8 +243,13 @@ export class DataRepo {
     if (!parsed.success) throw parsed.error;
     const id = recordFileId(kind, record);
     assertSafeId(id);
+    const rel = recordRelPath(KINDS[kind].dir, id);
+    if (isSecretLookingPath(rel)) {
+      // The push guard would refuse this name on every later sync; refuse it here, where it can be fixed.
+      throw new UnsafeNameError(`${rel} has a name that looks like a cookie or secret file; choose another id`);
+    }
 
-    const file = this.resolve(recordRelPath(KINDS[kind].dir, id));
+    const file = this.resolve(rel);
     this.assertCanWrite(kind, id, file);
     const body = `${JSON.stringify(parsed.data, null, 2)}\n`;
     atomicWrite(file, body);
@@ -345,4 +341,3 @@ export class DataRepo {
   }
 }
 
-export { SCHEMA_VERSION };

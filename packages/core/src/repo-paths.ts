@@ -9,8 +9,8 @@
 //   so tests can run the same code under Windows rules on any machine.
 import fs from 'node:fs';
 import nodePath from 'node:path';
-import { randomBytes } from 'node:crypto';
 import { UnsafeNameError } from './ids.ts';
+import { tempNameFor } from './names.ts';
 
 export type PathApi = nodePath.PlatformPath;
 
@@ -22,18 +22,30 @@ export type GuardFs = {
 
 const MISSING = new Set(['ENOENT', 'ENOTDIR']);
 
+/** `lstat`, or null when there is nothing at that path. */
+export function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch (e) {
+    if (MISSING.has((e as NodeJS.ErrnoException).code ?? '')) return null;
+    throw e;
+  }
+}
+
+/**
+ * The one path resolver of the package: the OS's own (`realpath(3)`, `GetFinalPathNameByHandle`), which gives
+ * the canonical spelling (letter case, drive letter, 8.3 short names expanded), as git reports paths.
+ * The JavaScript `fs.realpathSync` keeps the spelling it was given, so it is never used.
+ */
+export function realPath(p: string): string {
+  return fs.realpathSync.native(p);
+}
+
 export const nodeGuardFs: GuardFs = {
-  lstat(p) {
-    try {
-      return fs.lstatSync(p);
-    } catch (e) {
-      if (MISSING.has((e as NodeJS.ErrnoException).code ?? '')) return null;
-      throw e;
-    }
-  },
+  lstat: lstatOrNull,
   realpath(p) {
     try {
-      return fs.realpathSync.native(p);
+      return realPath(p);
     } catch (e) {
       if (MISSING.has((e as NodeJS.ErrnoException).code ?? '')) return null;
       throw e;
@@ -50,11 +62,6 @@ export type PathOptions = {
 
 function unsafe(relPath: string): UnsafeNameError {
   return new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-}
-
-/** Only a name that ends in `.tmp-` plus six lower-case hex digits is a temp file this module wrote. */
-export function isTmpArtifactName(name: string): boolean {
-  return /\.tmp-[0-9a-f]{6}$/.test(name);
 }
 
 /** True when any segment names `.git`. Letter case and trailing dots or spaces (which Windows drops) are ignored. */
@@ -169,14 +176,23 @@ export function recordRelPath(kindDir: string, id: string): string {
   return `${kindDir}/${id}.json`;
 }
 
-/** Write through a temp file next to the target and rename it into place. A failed write leaves no temp file. */
+/**
+ * Write through a temp file next to the target and rename it into place. The temp file is flushed to the disk
+ * before the rename, and on POSIX the folder after it, so a power cut leaves the old file or the new one, never
+ * an empty or missing one. A failed write leaves no temp file.
+ */
 export function atomicWrite(absPath: string, data: string | Uint8Array): void {
   const dir = nodePath.dirname(absPath);
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = nodePath.join(dir, `${nodePath.basename(absPath)}.tmp-${randomBytes(3).toString('hex')}`);
+  const tmp = nodePath.join(dir, tempNameFor(nodePath.basename(absPath)));
   try {
-    if (typeof data === 'string') fs.writeFileSync(tmp, data, 'utf8');
-    else fs.writeFileSync(tmp, data);
+    const fd = fs.openSync(tmp, 'w');
+    try {
+      fs.writeFileSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, absPath);
   } catch (e) {
     try {
@@ -186,4 +202,45 @@ export function atomicWrite(absPath: string, data: string | Uint8Array): void {
     }
     throw e;
   }
+  syncFolder(dir);
+}
+
+/** Flush a folder's entries (the rename) to the disk. POSIX only: Windows cannot open a folder this way. */
+function syncFolder(dir: string): void {
+  if (process.platform === 'win32') return;
+  let fd: number;
+  try {
+    fd = fs.openSync(dir, 'r');
+  } catch {
+    return;
+  }
+  try {
+    fs.fsyncSync(fd);
+  } catch {
+    // Some file systems refuse fsync on a folder; the file itself is already on the disk.
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * `text` (an error message) with every absolute path inside the repo folder made repo-relative with `/`, and
+ * the folder itself shown as `.`, so that it can be written into the repo, which is synced and pushed.
+ */
+export function withoutLocalPaths(repoDir: string, text: string): string {
+  const roots = new Set([nodePath.resolve(repoDir)]);
+  try {
+    roots.add(realPath(repoDir));
+  } catch {
+    // not there: only the spelling we were given
+  }
+  let out = text;
+  for (const root of [...roots].sort((a, b) => b.length - a.length)) {
+    const inside = new RegExp(`${escapeRegExp(root)}[\\\\/]([^\\s'"\`]*)`, 'g');
+    out = out.replace(inside, (_m, rest: string) => rest.replace(/\\/g, '/'));
+    out = out.split(root).join('.');
+  }
+  return out;
 }

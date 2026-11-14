@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { isSafeId } from './names.ts';
 
 export class UnsafeNameError extends Error {
   constructor(message: string) {
@@ -29,9 +30,12 @@ export function roleIdFor(link: string): string {
 
 const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
-/** Reduce an uploaded file name to one segment that is safe on Windows, macOS and Linux. */
+/**
+ * Reduce an uploaded file name to one segment that is safe on Windows, macOS and Linux. The name is put in
+ * Unicode NFC first, so a name typed on macOS (often decomposed) and the same name typed elsewhere are one file.
+ */
 export function safeFileName(name: string): string {
-  const last = name.split(/[/\\]/).pop() ?? '';
+  const last = name.normalize('NFC').split(/[/\\]/).pop() ?? '';
   const cleaned = last
     .trim()
     .replace(/[<>:"|?*\u0000-\u001f]/g, '_')
@@ -43,7 +47,7 @@ export function safeFileName(name: string): string {
 }
 
 export function assertSafeId(id: string): void {
-  if (!/^[A-Za-z0-9._-]+$/.test(id) || id === '.' || id === '..') {
+  if (!isSafeId(id)) {
     throw new UnsafeNameError(`unsafe id: ${JSON.stringify(id)}`);
   }
 }

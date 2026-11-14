@@ -38,12 +38,15 @@ export function applyPointOp(
       };
     }
     case 'remove':
-      if (existing === null) throw new PointOpError(`no point for op ${op.op}`);
-      return null;
     case 'confirm':
     case 'correct':
     case 'unsure':
-      if (existing === null) throw new PointOpError(`no point for op ${op.op}`);
+      // The op changes the point it names, and only that one: `existing` must be that point.
+      if (existing === null) throw new PointOpError(`no point ${op.pointId} for op ${op.op}`);
+      if (existing.id !== op.pointId) {
+        throw new PointOpError(`op ${op.op} names point ${op.pointId} but was given point ${existing.id}; nothing was changed`);
+      }
+      if (op.op === 'remove') return null;
       break;
   }
 

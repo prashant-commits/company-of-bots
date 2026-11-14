@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { httpUrlProblem } from './names.ts';
 
 export const SCHEMA_VERSION = 1;
 
@@ -24,20 +25,11 @@ export type StatusKind = z.infer<typeof StatusKindSchema>;
 export type InterviewKind = z.infer<typeof InterviewKindSchema>;
 export type ApplyPath = z.infer<typeof ApplyPathSchema>;
 
-const httpUrl = z
-  .string()
-  .refine((s) => {
-    try {
-      const u = new URL(s);
-      return u.protocol === 'http:' || u.protocol === 'https:';
-    } catch {
-      return false;
-    }
-  }, { message: 'URL must be http or https' });
+const httpUrl = z.string().refine((s) => httpUrlProblem(s) === null, { message: 'URL must be http or https' });
 
 export const EvidenceSchema = z.discriminatedUnion('type', [
-  z.looseObject({ type: z.literal('said'), quote: z.string() }),
-  z.looseObject({ type: z.literal('resume'), file: z.string(), quote: z.string() }),
+  z.looseObject({ type: z.literal('said'), quote: z.string().min(1) }),
+  z.looseObject({ type: z.literal('resume'), file: z.string(), quote: z.string().min(1) }),
 ]);
 export type Evidence = z.infer<typeof EvidenceSchema>;
 

@@ -2,6 +2,12 @@ import type { DataRepo } from './repo.ts';
 import { finishCommand, queuedCommands, CommandError } from './commands.ts';
 import type { Command, StatusNote, Park } from './schema.ts';
 import { recoverInterrupted } from './applications.ts';
+import { withoutLocalPaths } from './repo-paths.ts';
+
+/** A command's note is committed and pushed: an error's text goes in with repo-relative paths only. */
+function errorNote(repo: DataRepo, e: unknown): string {
+  return `failed: ${withoutLocalPaths(repo.dir, e instanceof Error ? e.message : String(e))}`;
+}
 
 export const HANDLED_VERBS = [
   'interview_saved',
@@ -49,8 +55,7 @@ export function processCommand(repo: DataRepo, cmd: Command, now: Date = new Dat
       try {
         app = repo.get('application', cmd.target);
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        outcome = { state: 'failed', note: `failed: ${msg}` };
+        outcome = { state: 'failed', note: errorNote(repo, e) };
         const currentCmd = repo.get('command', cmd.id);
         if (currentCmd?.state === 'queued') {
           finishCommand(repo, cmd.id, outcome.state, outcome.note, now);
@@ -247,8 +252,7 @@ export function processQueue(repo: DataRepo, now: Date = new Date()): Work[] {
         }
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      finishCommand(repo, cmd.id, 'failed', `failed: ${msg}`, now);
+      finishCommand(repo, cmd.id, 'failed', errorNote(repo, e), now);
     }
   }
 

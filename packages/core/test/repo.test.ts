@@ -917,6 +917,9 @@ describe('Q4 [path.win32] DataRepo itself under Windows path rules', () => {
       unlinkSync: one('unlinkSync'),
       rmSync: one('rmSync'),
       renameSync: (a: unknown, b: unknown) => real.renameSync(toReal(a) as string, toReal(b) as string),
+      openSync: one('openSync'),
+      fsyncSync: real.fsyncSync,
+      closeSync: real.closeSync,
       realpathSync: Object.assign((p: unknown, ...r: unknown[]) => toWin((real as any).realpathSync(toReal(p), ...r)), {
         native: (p: unknown, ...r: unknown[]) => toWin((real as any).realpathSync.native(toReal(p), ...r)),
       }),
