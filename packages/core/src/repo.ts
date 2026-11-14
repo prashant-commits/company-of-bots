@@ -1,8 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
-import { assertSafeId, UnsafeNameError } from './ids.ts';
+import { assertSafeId } from './ids.ts';
 import { KINDS, SINGLETONS, type KindName, type KindType, type SingletonName, type SingletonType, type Writer } from './layout.ts';
+import {
+  assertEntryIsPlainFile,
+  assertRegularFile,
+  atomicWrite,
+  isTmpArtifactName,
+  nodeGuardFs,
+  recordRelPath,
+  resolveRepoPath,
+  type PathOptions,
+} from './repo-paths.ts';
 import { RepoMetaSchema, SCHEMA_VERSION } from './schema.ts';
 import type { DayLog, Transcript } from './schema.ts';
 
@@ -28,104 +37,11 @@ function recordFileId(kind: KindName, record: KindType<KindName>): string {
   return (record as { id: string }).id;
 }
 
-function kindFilePath(dir: string, kind: KindName, id: string): string {
-  const entry = KINDS[kind];
-  return path.join(dir, entry.dir, `${id}.json`);
-}
-
-function relFromRepo(repoDir: string, abs: string): string {
-  return path.relative(repoDir, abs).split(path.sep).join('/');
-}
-
-function hasGitSegment(relPath: string): boolean {
-  return relPath
-    .replace(/\\/g, '/')
-    .split('/')
-    .some((part) => part.toLowerCase() === '.git');
-}
-
-function isTmpArtifactName(name: string): boolean {
-  return /\.tmp-[0-9a-f]+$/.test(name) || name.includes('.tmp-');
-}
-
-type PathOptions = {
-  /** Allow resolving to an existing directory (for list/listBlobs). */
-  allowExistingDirectory?: boolean;
-  /** Allow resolving exactly to the repo root (for listBlobs on ''). */
-  allowRepoRoot?: boolean;
-};
-
-function assertSafeRepoPath(repoDir: string, relPath: string, options: PathOptions = {}): string {
-  const normalized = relPath.replace(/\\/g, '/');
-  if (normalized === '' || normalized === '.' || normalized === './') {
-    if (options.allowRepoRoot && normalized === '') {
-      const root = path.resolve(repoDir);
-      assertPathNoSymlinkEscape(repoDir, root);
-      return root;
-    }
-    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-  }
-
-  if (hasGitSegment(normalized)) {
-    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-  }
-
-  const abs = path.resolve(repoDir, relPath);
-  const root = path.resolve(repoDir);
-  if (abs !== root && !abs.startsWith(`${root}${path.sep}`)) {
-    throw new UnsafeNameError(`path escapes repo: ${JSON.stringify(relPath)}`);
-  }
-
-  if (abs === root && !options.allowRepoRoot) {
-    throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-  }
-
-  if (fs.existsSync(abs)) {
-    const stat = fs.statSync(abs);
-    if (stat.isDirectory() && !options.allowExistingDirectory) {
-      throw new UnsafeNameError(`path is a directory: ${JSON.stringify(relPath)}`);
-    }
-  }
-
-  assertPathNoSymlinkEscape(repoDir, abs);
-  return abs;
-}
-
-function assertPathNoSymlinkEscape(repoDir: string, absPath: string): void {
-  const root = path.resolve(repoDir);
-  const rootReal = fs.realpathSync.native(root);
-
-  let current = root;
-  const rel = path.relative(root, absPath);
-  if (rel !== '' && rel !== '.') {
-    for (const part of rel.split(path.sep)) {
-      if (!part || part === '.') continue;
-      current = path.join(current, part);
-      if (fs.existsSync(current)) {
-        if (fs.lstatSync(current).isSymbolicLink()) {
-          throw new UnsafeNameError(`symbolic link in repo path: ${relFromRepo(repoDir, current)}`);
-        }
-      }
-    }
-  }
-
-  let anchor = absPath;
-  while (!fs.existsSync(anchor)) {
-    if (anchor === root) break;
-    anchor = path.dirname(anchor);
-  }
-  const anchorReal = fs.realpathSync.native(anchor);
-  if (anchorReal !== rootReal && !anchorReal.startsWith(`${rootReal}${path.sep}`)) {
-    throw new UnsafeNameError(`path escapes repo via symlink`);
-  }
-}
-
 const BLOB_RESUME = /^profile\/resumes\/([^/]+)$/;
 const BLOB_RESUME_TEXT = /^profile\/resume-text\/([^/]+)$/;
 
-function assertBlobWriteDeletePath(relPath: string, writer: Writer): string {
-  const p = relPath.replace(/\\/g, '/');
-  const match = BLOB_RESUME.exec(p) ?? BLOB_RESUME_TEXT.exec(p);
+function assertBlobWriteDeletePath(relPath: string, writer: Writer): void {
+  const match = BLOB_RESUME.exec(relPath) ?? BLOB_RESUME_TEXT.exec(relPath);
   const name = match?.[1];
   if (!name || name === '.' || name === '..') {
     throw new OwnershipError(`blob path not allowed: ${JSON.stringify(relPath)}`);
@@ -133,7 +49,16 @@ function assertBlobWriteDeletePath(relPath: string, writer: Writer): string {
   if (writer !== 'app') {
     throw new OwnershipError(`only the app may write resume blobs`);
   }
-  return p;
+}
+
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw e;
+  }
 }
 
 function recordStemMatches(kind: KindName, filePath: string, record: KindType<KindName>): boolean {
@@ -147,27 +72,12 @@ function parseJsonUtf8(raw: string): unknown {
   return JSON.parse(text);
 }
 
-function atomicWrite(absPath: string, data: string | Uint8Array): void {
-  const dir = path.dirname(absPath);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `${path.basename(absPath)}.tmp-${randomBytes(3).toString('hex')}`);
-  try {
-    if (typeof data === 'string') fs.writeFileSync(tmp, data, 'utf8');
-    else fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, absPath);
-  } catch (e) {
-    try {
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-    } catch {
-      /* ignore cleanup failure */
-    }
-    throw e;
-  }
-}
-
 function readCobJsonMeta(dir: string): void {
-  const metaPath = path.join(dir, 'cob.json');
-  if (!fs.existsSync(metaPath)) return;
+  // Same rule as getSingleton('meta'): a link, or anything that is not a regular file, is refused before any read.
+  const metaPath = resolveRepoPath(path, nodeGuardFs, dir, SINGLETONS.meta.path);
+  const st = lstatOrNull(metaPath);
+  if (st === null) return;
+  assertRegularFile(st, SINGLETONS.meta.path);
 
   let raw: string;
   try {
@@ -213,11 +123,18 @@ export class DataRepo {
     readCobJsonMeta(dir);
   }
 
+  /** Native absolute path for a repo-relative `/` path, or `UnsafeNameError`. Every method goes through here. */
+  private resolve(relPath: string, options: PathOptions = {}): string {
+    return resolveRepoPath(path, nodeGuardFs, this.dir, relPath, options);
+  }
+
   get<K extends KindName>(kind: K, id: string): KindType<K> | null {
     assertSafeId(id);
-    const file = kindFilePath(this.dir, kind, id);
-    if (!fs.existsSync(file)) return null;
-    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
+    const rel = recordRelPath(KINDS[kind].dir, id);
+    const file = this.resolve(rel);
+    const st = lstatOrNull(file);
+    if (st === null) return null;
+    assertRegularFile(st, rel);
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -242,26 +159,31 @@ export class DataRepo {
 
   list<K extends KindName>(kind: K): { items: KindType<K>[]; errors: RepoReadError[] } {
     const entry = KINDS[kind];
-    const kindDir = path.join(this.dir, entry.dir);
     const items: KindType<K>[] = [];
     const errors: RepoReadError[] = [];
-    if (!fs.existsSync(kindDir)) return { items, errors };
 
+    // The kind directory is checked once. Each entry then needs only its own check.
+    let kindDir: string;
     try {
-      assertSafeRepoPath(this.dir, entry.dir, { allowExistingDirectory: true });
+      kindDir = this.resolve(entry.dir, { allowExistingDirectory: true });
     } catch (e) {
-      errors.push({
-        file: kindDir,
-        error: e instanceof Error ? e.message : String(e),
-      });
+      errors.push({ file: path.join(this.dir, entry.dir), error: e instanceof Error ? e.message : String(e) });
       return { items, errors };
     }
+    let names: string[];
+    try {
+      names = fs.readdirSync(kindDir);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { items, errors };
+      throw e;
+    }
 
-    for (const name of fs.readdirSync(kindDir)) {
+    for (const name of names) {
       if (!name.endsWith('.json') || isTmpArtifactName(name)) continue;
       const file = path.join(kindDir, name);
       try {
-        assertSafeRepoPath(this.dir, path.relative(this.dir, file));
+        assertEntryIsPlainFile(path, nodeGuardFs, file, `${entry.dir}/${name}`);
       } catch (e) {
         errors.push({ file, error: e instanceof Error ? e.message : String(e) });
         continue;
@@ -285,6 +207,13 @@ export class DataRepo {
         errors.push({ file, error: result.error.message });
         continue;
       }
+      const key = recordFileId(kind, result.data as KindType<KindName>);
+      try {
+        assertSafeId(key);
+      } catch (e) {
+        errors.push({ file, error: e instanceof Error ? e.message : String(e) });
+        continue;
+      }
       if (!recordStemMatches(kind, file, result.data as KindType<KindName>)) {
         errors.push({ file, error: `record id does not match file name` });
         continue;
@@ -299,9 +228,8 @@ export class DataRepo {
     return { items, errors };
   }
 
-  private assertCanWrite(kind: KindName, id: string): void {
+  private assertCanWrite(kind: KindName, id: string, file: string): void {
     const entry = KINDS[kind];
-    const file = kindFilePath(this.dir, kind, id);
     const exists = fs.existsSync(file);
 
     if (entry.owner === 'command') {
@@ -324,31 +252,31 @@ export class DataRepo {
     if (!parsed.success) throw parsed.error;
     const id = recordFileId(kind, record);
     assertSafeId(id);
-    this.assertCanWrite(kind, id);
 
-    const file = kindFilePath(this.dir, kind, id);
-    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
+    const file = this.resolve(recordRelPath(KINDS[kind].dir, id));
+    this.assertCanWrite(kind, id, file);
     const body = `${JSON.stringify(parsed.data, null, 2)}\n`;
     atomicWrite(file, body);
   }
 
   delete<K extends KindName>(kind: K, id: string): void {
     assertSafeId(id);
+    const file = this.resolve(recordRelPath(KINDS[kind].dir, id));
     if (kind === 'command') throw new OwnershipError('commands may not be deleted');
     const entry = KINDS[kind];
     if (this.writer !== entry.owner) {
       throw new OwnershipError(`${this.writer} may not delete ${kind}`);
     }
-    const file = kindFilePath(this.dir, kind, id);
-    assertSafeRepoPath(this.dir, path.relative(this.dir, file));
-    if (fs.existsSync(file)) fs.unlinkSync(file);
+    if (lstatOrNull(file) === null) return;
+    fs.unlinkSync(file);
   }
 
   getSingleton<S extends SingletonName>(name: S): SingletonType<S> | null {
     const entry = SINGLETONS[name];
-    const file = path.join(this.dir, entry.path);
-    if (!fs.existsSync(file)) return null;
-    assertSafeRepoPath(this.dir, entry.path);
+    const file = this.resolve(entry.path);
+    const st = lstatOrNull(file);
+    if (st === null) return null;
+    assertRegularFile(st, entry.path);
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -375,52 +303,45 @@ export class DataRepo {
     }
     const parsed = entry.schema.safeParse(value);
     if (!parsed.success) throw parsed.error;
-    const file = path.join(this.dir, entry.path);
-    assertSafeRepoPath(this.dir, entry.path);
+    const file = this.resolve(entry.path);
     const body = `${JSON.stringify(parsed.data, null, 2)}\n`;
     atomicWrite(file, body);
   }
 
+  // Blob paths are repo-relative with `/`, on every OS. Escapes, absolute and drive paths, `\` and `.git`
+  // are refused by `resolve` before the ownership check runs.
+
   writeBlob(relPath: string, bytes: Uint8Array): void {
-    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
-      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-    }
-    const abs = assertSafeRepoPath(this.dir, relPath);
+    const abs = this.resolve(relPath);
     assertBlobWriteDeletePath(relPath, this.writer);
     atomicWrite(abs, bytes);
   }
 
   readBlob(relPath: string): Buffer | null {
-    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
-      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-    }
-    const abs = assertSafeRepoPath(this.dir, relPath, {
-      allowExistingDirectory: true,
-      allowRepoRoot: relPath.replace(/\\/g, '/') === '',
-    });
-    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) return null;
+    const abs = this.resolve(relPath, { allowExistingDirectory: true, allowRepoRoot: relPath === '' });
+    const st = lstatOrNull(abs);
+    if (st === null || st.isDirectory()) return null;
+    assertRegularFile(st, relPath);
     return fs.readFileSync(abs);
   }
 
   listBlobs(relDir: string): string[] {
-    if (hasGitSegment(relDir.replace(/\\/g, '/'))) {
-      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relDir)}`);
+    const abs = this.resolve(relDir, { allowExistingDirectory: true, allowRepoRoot: relDir === '' });
+    let names: string[];
+    try {
+      names = fs.readdirSync(abs);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      throw e;
     }
-    const abs = assertSafeRepoPath(this.dir, relDir, {
-      allowExistingDirectory: true,
-      allowRepoRoot: relDir.replace(/\\/g, '/') === '',
-    });
-    if (!fs.existsSync(abs)) return [];
-    return fs.readdirSync(abs).filter((n) => !isTmpArtifactName(n));
+    return names.filter((n) => !isTmpArtifactName(n));
   }
 
   deleteBlob(relPath: string): void {
-    if (hasGitSegment(relPath.replace(/\\/g, '/'))) {
-      throw new UnsafeNameError(`unsafe repo path: ${JSON.stringify(relPath)}`);
-    }
-    const abs = assertSafeRepoPath(this.dir, relPath);
+    const abs = this.resolve(relPath);
     assertBlobWriteDeletePath(relPath, this.writer);
-    if (fs.existsSync(abs)) fs.unlinkSync(abs);
+    if (lstatOrNull(abs) !== null) fs.unlinkSync(abs);
   }
 }
 
