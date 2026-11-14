@@ -1114,9 +1114,14 @@ test('S13 GitError never carries file contents', async () => {
 }, T);
 
 test('S13 more than 256 MiB staged at once syncs', async () => {
-  for (let i = 0; i < 40; i++) fs.writeFileSync(path.join(appDir, `blob-${i}.bin`), Buffer.alloc(7 * 1024 * 1024, i + 1));
-  expect((await syncRepo(appDir, 'app', 'big')).pushed).toBe(true);
-  expect(remoteTree()).toContain('blob-39.bin');
+  try {
+    for (let i = 0; i < 40; i++) fs.writeFileSync(path.join(appDir, `blob-${i}.bin`), Buffer.alloc(7 * 1024 * 1024, i + 1));
+    expect((await syncRepo(appDir, 'app', 'big')).pushed).toBe(true);
+    expect(remoteTree()).toContain('blob-39.bin');
+  } finally {
+    // R11: 280 MiB of files and the repos holding them go now, even when the test fails.
+    for (const d of [appDir, agentDir, path.dirname(remote)]) fs.rmSync(d, { recursive: true, force: true });
+  }
 }, 120_000);
 
 // --- S14: init --------------------------------------------------------------
@@ -1247,3 +1252,415 @@ test('S16 unstaging a secret treats glob characters in its name literally (a sta
   expect(() => assertNoSecrets(appDir, ['n*tes.json'])).toThrow(SecretLeakError);
   expect(sh(appDir, 'diff', '--cached', '--name-only')).toBe('notes.json\n');
 });
+
+// ===========================================================================
+// cob-d2 (rows R1-R11)
+// ===========================================================================
+
+// --- R1: recovering a left-behind rebase never loses an edit ------------------
+
+/**
+ * Leave appDir stopped in a rebase: the agent pushed notes.txt, the app has two unpushed commits
+ * (notes.txt, then late.txt), and `git pull --rebase` stopped on the notes.txt conflict.
+ * The app owns notes.txt (unowned paths go to the app), so the app's own edits win the owner rule.
+ */
+async function stuckAppRebase(): Promise<void> {
+  write(agentDir, 'notes.txt', 'agent\n');
+  await syncRepo(agentDir, 'agent', 'agent notes');
+  write(appDir, 'notes.txt', 'app\n');
+  sh(appDir, 'add', '-A');
+  sh(appDir, 'commit', '-q', '-m', 'app notes');
+  write(appDir, 'late.txt', 'late local\n');
+  sh(appDir, 'add', '-A');
+  sh(appDir, 'commit', '-q', '-m', 'app late');
+  expect(() => sh(appDir, 'pull', '--rebase', '--no-autostash', 'origin', 'main')).toThrow();
+  expect(rebaseInProgress(appDir)).toBe(true);
+  expect(read(appDir, 'notes.txt')).toContain('<<<<<<<');
+}
+const remoteFile = (rel: string) => sh(remote, 'show', `main:${rel}`);
+
+test('R1 an unstaged edit to the conflicted file survives recovery and is pushed', async () => {
+  await stuckAppRebase();
+  write(appDir, 'notes.txt', 'USER-UNSTAGED-RESOLUTION\n');
+  write(appDir, 'extra.txt', 'extra-unstaged\n');
+  expect((await syncRepo(appDir, 'app', 'recover')).pushed).toBe(true);
+  expect(rebaseInProgress(appDir)).toBe(false);
+  expect(read(appDir, 'notes.txt')).toBe('USER-UNSTAGED-RESOLUTION\n');
+  expect(remoteFile('notes.txt')).toBe('USER-UNSTAGED-RESOLUTION\n');
+  expect(remoteFile('extra.txt')).toBe('extra-unstaged\n');
+  expect(remoteFile('late.txt')).toBe('late local\n'); // the unreplayed local commit is not lost
+  clean(appDir);
+}, T);
+
+test('R1 a staged resolution, a staged edit to another file and a staged new file all survive and are pushed', async () => {
+  await stuckAppRebase();
+  const readme = 'STAGED-README-MARKER\n';
+  write(appDir, 'notes.txt', 'USER-STAGED-RESOLUTION\n');
+  write(appDir, 'README.md', readme);
+  write(appDir, 'staged-new.txt', 'STAGED-NEW-MARKER\n');
+  sh(appDir, 'add', 'notes.txt', 'README.md', 'staged-new.txt');
+  expect((await syncRepo(appDir, 'app', 'recover')).pushed).toBe(true);
+  for (const [rel, text] of [['notes.txt', 'USER-STAGED-RESOLUTION\n'], ['README.md', readme], ['staged-new.txt', 'STAGED-NEW-MARKER\n']]) {
+    expect(read(appDir, rel!)).toBe(text);
+    expect(remoteFile(rel!)).toBe(text);
+  }
+  clean(appDir);
+}, T);
+
+test('R1 deleting the conflicted file is kept: it is not brought back', async () => {
+  await stuckAppRebase();
+  fs.unlinkSync(path.join(appDir, 'notes.txt'));
+  expect((await syncRepo(appDir, 'app', 'recover')).pushed).toBe(true);
+  expect(exists(appDir, 'notes.txt')).toBe(false);
+  expect(remoteTree()).not.toMatch(/^notes\.txt$/m);
+  expect(remoteFile('late.txt')).toBe('late local\n');
+  clean(appDir);
+}, T);
+
+test('R1 untouched files go back to the branch: no conflict markers are ever committed', async () => {
+  await stuckAppRebase();
+  write(appDir, 'other.txt', 'other edit\n');
+  expect((await syncRepo(appDir, 'app', 'recover')).pushed).toBe(true);
+  expect(read(appDir, 'notes.txt')).toBe('app\n'); // the owner's committed version
+  expect(remoteFile('notes.txt')).toBe('app\n');
+  expect(remoteFile('other.txt')).toBe('other edit\n');
+  expect(sh(remote, 'log', '-p', 'main')).not.toContain('<<<<<<<');
+  clean(appDir);
+}, T);
+
+test('R1 staged content that differs from the file on disk cannot be kept: GitError, and nothing changes', async () => {
+  await stuckAppRebase();
+  write(appDir, 'notes.txt', 'STAGED VERSION\n');
+  sh(appDir, 'add', 'notes.txt');
+  write(appDir, 'notes.txt', 'DISK VERSION\n');
+  write(appDir, 'new.txt', 'new\n');
+  const status = sh(appDir, 'status', '--porcelain');
+  const before = sh(remote, 'rev-parse', 'main');
+  const err = (await syncRepo(appDir, 'app', 'recover').catch((e: unknown) => e)) as GitError;
+  expect(err).toBeInstanceOf(GitError);
+  expect(err.message).toContain('notes.txt');
+  expect(rebaseInProgress(appDir)).toBe(true);
+  expect(sh(appDir, 'status', '--porcelain')).toBe(status);
+  expect(sh(appDir, 'show', ':notes.txt')).toBe('STAGED VERSION\n');
+  expect(read(appDir, 'notes.txt')).toBe('DISK VERSION\n');
+  expect(read(appDir, 'new.txt')).toBe('new\n');
+  expect(sh(remote, 'rev-parse', 'main')).toBe(before);
+}, T);
+
+test('R1 commits made by hand during the rebase are not dropped: GitError, and nothing changes', async () => {
+  await stuckAppRebase();
+  write(appDir, 'notes.txt', 'resolved and committed\n');
+  sh(appDir, 'add', 'notes.txt');
+  sh(appDir, '-c', 'core.editor=true', 'commit', '-q', '-m', 'hand commit');
+  const head = sh(appDir, 'rev-parse', 'HEAD');
+  await expect(syncRepo(appDir, 'app', 'recover')).rejects.toBeInstanceOf(GitError);
+  expect(rebaseInProgress(appDir)).toBe(true);
+  expect(sh(appDir, 'rev-parse', 'HEAD')).toBe(head);
+}, T);
+
+// --- R2/R3: init resumes only its own repo, and every push is scanned -----------------
+
+test('R2 a one-commit repo with the init message that init did not create is refused and not changed', async () => {
+  const dir = tmpDir();
+  sh(dir, 'init', '-q', '-b', 'main');
+  sh(dir, 'config', 'user.name', 'Someone');
+  sh(dir, 'config', 'user.email', 'someone@example.com');
+  write(dir, 'notes/export.txt', NETSCAPE);
+  sh(dir, 'add', '-A');
+  sh(dir, 'commit', '-q', '-m', 'Initialize private data repo');
+  const r2 = bare();
+  const head = sh(dir, 'rev-parse', 'HEAD');
+  await expect(initPrivateRepo(dir, { identity, remote: r2 })).rejects.toBeInstanceOf(GitError);
+  expect(sh(dir, 'config', 'user.name').trim()).toBe('Someone');
+  expect(sh(dir, 'remote')).toBe('');
+  expect(sh(dir, 'rev-parse', 'HEAD')).toBe(head);
+  expect(sh(r2, 'for-each-ref')).toBe('');
+}, T);
+
+/** Init against a remote that refuses the first push; returns the folder and the remote. */
+async function failedInit(): Promise<{ dir: string; r2: string }> {
+  const r2 = bare();
+  hook(r2, 'pre-receive', 'echo "not yet" >&2; exit 1');
+  const dir = path.join(tmpDir(), 'init');
+  await expect(initPrivateRepo(dir, { identity, remote: r2 })).rejects.toBeInstanceOf(GitError);
+  return { dir, r2 };
+}
+
+test('R2 a resumed init finishes the first push even after more commits were made', async () => {
+  const { dir, r2 } = await failedInit();
+  new DataRepo(dir, 'app').put('source', sample.source({ id: 's1' }));
+  await expect(syncRepo(dir, 'app', 'add source')).rejects.toBeInstanceOf(GitError); // still refused
+  write(dir, 'notes.txt', 'later\n');
+  sh(dir, 'add', '-A');
+  sh(dir, 'commit', '-q', '-m', 'by hand');
+  fs.unlinkSync(path.join(r2, 'hooks', 'pre-receive'));
+  await initPrivateRepo(dir, { identity, remote: r2 });
+  expect(sh(r2, 'rev-parse', 'main')).toBe(sh(dir, 'rev-parse', 'HEAD'));
+  expect(sh(dir, 'rev-list', '--count', 'HEAD').trim()).toBe('3');
+  expect(sh(dir, 'rev-parse', '--abbrev-ref', '@{u}').trim()).toBe('origin/main');
+  await initPrivateRepo(dir, { identity, remote: r2 }); // done already: harmless
+}, T);
+
+test('R2 syncRepo makes the first push of a repo whose upstream was never pushed', async () => {
+  const { dir, r2 } = await failedInit();
+  fs.unlinkSync(path.join(r2, 'hooks', 'pre-receive'));
+  write(dir, 'notes.txt', 'first\n');
+  const r = await syncRepo(dir, 'app', 'first sync');
+  expect(r).toMatchObject({ pushed: true, resolved: [] });
+  expect(sh(r2, 'rev-parse', 'main')).toBe(sh(dir, 'rev-parse', 'HEAD'));
+  expect(sh(r2, 'log', '--format=%s', 'main')).toBe('first sync\nInitialize private data repo\n');
+  expect(await pullRepo(dir, 'app')).toMatchObject({ committed: null, pushed: false });
+}, T);
+
+test('R2 a call killed before the init commit is resumed: the marker proves the folder is ours', async () => {
+  // Killed right after writing the marker: .git holds only the marker.
+  const d1 = path.join(tmpDir(), 'a');
+  fs.mkdirSync(path.join(d1, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(d1, '.git', 'cob-init.json'), '{"app":"company-of-bots","commit":null}\n');
+  await initPrivateRepo(d1, { identity });
+  expect(sh(d1, 'log', '--format=%s')).toBe('Initialize private data repo\n');
+  // Killed in the middle of writing the layout: git init ran, one layout file is half there.
+  const d2 = path.join(tmpDir(), 'b');
+  fs.mkdirSync(path.join(d2, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(d2, '.git', 'cob-init.json'), '{"app":"company-of-bots","commit":null}\n');
+  sh(d2, 'init', '-q', '-b', 'main');
+  write(d2, 'guide/lanes.json', '{"la');
+  await initPrivateRepo(d2, { identity });
+  expect(sh(d2, 'log', '--format=%s')).toBe('Initialize private data repo\n');
+  expect(new DataRepo(d2, 'app').getSingleton('lanes')).not.toBeNull();
+  expect(sh(d2, 'status', '--porcelain')).toBe('');
+  // An unborn repo without the marker is someone else's.
+  const d3 = tmpDir();
+  sh(d3, 'init', '-q', '-b', 'main');
+  await expect(initPrivateRepo(d3, { identity })).rejects.toBeInstanceOf(GitError);
+  expect(fs.readdirSync(d3)).toEqual(['.git']);
+}, T);
+
+test('R3 the init retry scans every commit it pushes: a cookie body is refused and never on the remote', async () => {
+  const { dir, r2 } = await failedInit();
+  write(dir, 'notes/export.txt', NETSCAPE);
+  sh(dir, 'add', '-A');
+  sh(dir, 'commit', '-q', '-m', 'outside');
+  fs.unlinkSync(path.join(r2, 'hooks', 'pre-receive'));
+  const err = (await initPrivateRepo(dir, { identity, remote: r2 }).catch((e: unknown) => e)) as SecretLeakError;
+  expect(err).toBeInstanceOf(SecretLeakError);
+  expect(err.paths).toEqual(['notes/export.txt']);
+  expect(sh(r2, 'for-each-ref')).toBe('');
+  // syncRepo's first push is scanned from the empty tree as well.
+  await expect(syncRepo(dir, 'app', 'x')).rejects.toBeInstanceOf(SecretLeakError);
+  expect(sh(r2, 'for-each-ref')).toBe('');
+}, T);
+
+// --- R4: a UTF-16 BOM in front of ASCII cookie text -----------------------------------
+
+test('R4 ASCII cookie text after a UTF-16 BOM is refused (raw bytes and decoded text are both searched)', async () => {
+  const files: Record<string, Buffer> = {
+    'notes/le-prefix.txt': Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(NETSCAPE)]),
+    'notes/be-prefix.txt': Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(NETSCAPE)]),
+    'notes/le-prefix.json': Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"sameSite":"Lax","httpOnly":true}')]),
+  };
+  fs.mkdirSync(path.join(appDir, 'notes'));
+  for (const [rel, body] of Object.entries(files)) fs.writeFileSync(path.join(appDir, rel), body);
+  const err = (await syncRepo(appDir, 'app', 'x').catch((e: unknown) => e)) as SecretLeakError;
+  expect(err).toBeInstanceOf(SecretLeakError);
+  expect([...err.paths].sort()).toEqual(Object.keys(files).sort());
+  expect(remoteHistory()).not.toContain('prefix');
+}, T);
+
+// --- R5: the remote's history wins for anything already pushed --------------------------
+
+/** On the git host, drop the remote's last commit (a force push from a third clone). */
+function rewindRemote(): void {
+  const third = thirdClone();
+  sh(third, 'reset', '-q', '--hard', 'HEAD~1');
+  sh(third, 'push', '-q', '--force', 'origin', 'main');
+}
+
+test('R5 a commit removed on the git host is not pushed back, with or without new local commits', async () => {
+  write(appDir, 'notes/transcript.txt', 'private\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  await pullRepo(agentDir, 'agent');
+  rewindRemote();
+  // Nothing new on the agent: it follows the remote.
+  expect(await syncRepo(agentDir, 'agent', 'noop')).toMatchObject({ committed: null, pushed: true });
+  expect(remoteHistory()).not.toContain('transcript');
+  expect(exists(agentDir, 'notes/transcript.txt')).toBe(false);
+  expect(sh(agentDir, 'rev-parse', 'HEAD')).toBe(sh(remote, 'rev-parse', 'main'));
+  // A new local commit on the app, which still has the removed commit: only the new commit goes out.
+  write(appDir, 'new.txt', 'new\n');
+  const r = await syncRepo(appDir, 'app', 'new');
+  expect(r.pushed).toBe(true);
+  expect(remoteHistory()).not.toContain('transcript');
+  expect(remoteTree()).toContain('new.txt');
+  expect(exists(appDir, 'notes/transcript.txt')).toBe(false);
+  clean(appDir);
+}, T);
+
+test('R5 pullRepo follows the rewrite too', async () => {
+  write(appDir, 'notes/transcript.txt', 'private\n');
+  await syncRepo(appDir, 'app', 'transcript');
+  await pullRepo(agentDir, 'agent');
+  rewindRemote();
+  await pullRepo(agentDir, 'agent');
+  expect(sh(agentDir, 'rev-parse', 'HEAD')).toBe(sh(remote, 'rev-parse', 'main'));
+  expect(exists(agentDir, 'notes/transcript.txt')).toBe(false);
+}, T);
+
+test('R5 a scrubbed cookie commit does not block the other checkout', async () => {
+  shipRaw(appDir, { 'tmp/s.json': COOKIE_JSON }, 'leaked by hand');
+  await pullRepo(agentDir, 'agent');
+  rewindRemote();
+  write(agentDir, 'work.txt', 'agent work\n');
+  expect((await syncRepo(agentDir, 'agent', 'work')).pushed).toBe(true);
+  expect(remoteHistory()).not.toContain('tmp/s.json');
+  expect(remoteTree()).toContain('work.txt');
+}, T);
+
+// --- R6/R8: files changed mid-sync ---------------------------------------------------------
+
+test('R6 a file deleted mid-sync that the incoming change touches stays deleted, and the deletion is committed', async () => {
+  write(appDir, 'notes.txt', 'base\n');
+  await syncRepo(appDir, 'app', 'base');
+  await pullRepo(agentDir, 'agent');
+  write(agentDir, 'notes.txt', 'agent edit\n');
+  await syncRepo(agentDir, 'agent', 'agent edit');
+  write(appDir, 'other.txt', 'x\n');
+  let once = true;
+  const r = await syncRepo(appDir, 'app', 'app', {
+    beforeIntegrate: async () => {
+      if (once) fs.unlinkSync(path.join(appDir, 'notes.txt'));
+      once = false;
+    },
+  });
+  expect(r).toMatchObject({ pushed: true, resolved: ['notes.txt'] }); // the app owns it: its delete wins
+  expect(exists(appDir, 'notes.txt')).toBe(false);
+  expect(remoteTree()).not.toMatch(/^notes\.txt$/m);
+  clean(appDir);
+}, T);
+
+test('R8 a file rewritten with identical bytes mid-sync is not an error', async () => {
+  write(appDir, 'notes.txt', 'base\n');
+  await syncRepo(appDir, 'app', 'base');
+  await pullRepo(agentDir, 'agent');
+  write(agentDir, 'notes.txt', 'agent edit\n');
+  await syncRepo(agentDir, 'agent', 'agent edit');
+  write(appDir, 'other.txt', 'x\n');
+  const r = await syncRepo(appDir, 'app', 'app', {
+    beforeIntegrate: async () => {
+      const file = path.join(appDir, 'notes.txt');
+      const body = fs.readFileSync(file);
+      fs.unlinkSync(file); // a new inode and new times, same bytes
+      fs.writeFileSync(file, body);
+    },
+  });
+  expect(r.pushed).toBe(true);
+  expect(read(appDir, 'notes.txt')).toBe('agent edit\n');
+  clean(appDir);
+}, T);
+
+// --- R7: the lock belongs to one acquisition -------------------------------------------------
+
+const sharedState = () =>
+  (globalThis as Record<symbol, unknown>)[Symbol.for('company-of-bots.core.git.sync-state.v1')] as {
+    held: Map<string, string>;
+  };
+
+test('R7 a live lock held by another copy of the module in this process is never taken over', async () => {
+  const lock = path.join(sh(appDir, 'rev-parse', '--absolute-git-dir').trim(), 'cob-sync.lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now(), token: 'held-by-another-copy' }));
+  sharedState().held.set(lock, 'held-by-another-copy');
+  write(appDir, 'a.txt', 'a\n');
+  try {
+    await expect(syncRepo(appDir, 'app', 'x')).rejects.toBeInstanceOf(SyncBusyError);
+    expect(fs.readFileSync(lock, 'utf8')).toContain('held-by-another-copy');
+    expect(sh(appDir, 'status', '--porcelain')).toBe('?? a.txt\n');
+  } finally {
+    sharedState().held.delete(lock);
+  }
+  // Same pid, but no acquisition in this process holds that token (an earlier process): stale, taken over.
+  expect((await syncRepo(appDir, 'app', 'x')).pushed).toBe(true);
+  expect(fs.existsSync(lock)).toBe(false);
+}, T);
+
+test('R7 two copies of the module in one process run calls on one checkout one after another', async () => {
+  const spec = '../src/git.ts?second-copy';
+  const copy = (await import(/* @vite-ignore */ spec)) as typeof import('../src/git.ts');
+  expect(copy.syncRepo).not.toBe(syncRepo);
+  const log: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  write(appDir, 'a.txt', 'a\n');
+  const first = syncRepo(appDir, 'app', 'first', {
+    beforePush: async () => {
+      log.push('first-at-push');
+      await gate;
+    },
+  });
+  await waitFor(() => log.includes('first-at-push'));
+  write(appDir, 'b.txt', 'b\n');
+  const second = copy.syncRepo(appDir, 'app', 'second', { beforeIntegrate: async () => void log.push('second-started') });
+  await sleep(300);
+  expect(log).not.toContain('second-started');
+  release();
+  const [r1, r2] = await Promise.all([first, second]);
+  expect([r1.pushed, r2.pushed]).toEqual([true, true]);
+  expect(remoteTree()).toContain('b.txt');
+}, T);
+
+// --- R9: a missing folder ---------------------------------------------------------------------
+
+test('R9 a folder that does not exist is a GitError', async () => {
+  const missing = path.join(tmpDir(), 'nope');
+  await expect(syncRepo(missing, 'app', 'x')).rejects.toBeInstanceOf(GitError);
+  await expect(pullRepo(missing, 'app')).rejects.toBeInstanceOf(GitError);
+}, T);
+
+// --- R10: tests that catch weakened guards ----------------------------------------------------
+
+test('R10 a cookie needle split by the scanner’s 1 MiB read boundary is still found', () => {
+  // One staged blob is scanned from `<sha> blob <size>\n<content>`; the read boundary is at 1 MiB of that.
+  const size = 1_310_720;
+  const header = 40 + ' blob '.length + String(size).length + 1;
+  const boundary = 1024 * 1024 - header; // offset in the content where one read ends
+  const cases: { name: string; body: (at: number) => Buffer; needle: number }[] = [
+    { name: 'ns', needle: NETSCAPE.length, body: (at) => Buffer.from(' '.repeat(at) + NETSCAPE) },
+    { name: 'js', needle: 10, body: (at) => Buffer.from('"httpOnly"' + ' '.repeat(at - 10) + '"sameSite"') },
+    {
+      name: 'u16',
+      needle: 54,
+      body: (at) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(' '.repeat((at - 2) / 2) + '# Netscape HTTP Cookie File', 'utf16le')]),
+    },
+  ];
+  for (const c of cases) {
+    for (const split of [1, 7, c.needle - 1]) {
+      let at = boundary - split;
+      if (c.name === 'u16' && at % 2 === 1) at -= 1; // keep the UTF-16 text aligned; the split moves by one byte
+      const body = c.body(at);
+      const rel = `pad/${c.name}-${split}.txt`;
+      fs.mkdirSync(path.join(appDir, 'pad'), { recursive: true });
+      fs.writeFileSync(path.join(appDir, rel), Buffer.concat([body, Buffer.alloc(size - body.length, 0x20)]));
+      sh(appDir, 'add', '-f', '--', rel);
+      expect(() => assertNoSecrets(appDir, [rel]), rel).toThrow(SecretLeakError);
+      fs.unlinkSync(path.join(appDir, rel));
+    }
+  }
+}, T);
+
+test('R10 a file the incoming change touches, written mid-sync, makes the sync commit it and integrate again', async () => {
+  write(appDir, 'x.txt', 'base\n');
+  await syncRepo(appDir, 'app', 'base');
+  await pullRepo(agentDir, 'agent');
+  write(agentDir, 'x.txt', 'agent\n');
+  await syncRepo(agentDir, 'agent', 'agent x');
+  let calls = 0;
+  const r = await syncRepo(appDir, 'app', 'app x', {
+    beforeIntegrate: async () => {
+      calls++;
+      if (calls === 1) write(appDir, 'x.txt', 'app, written mid-sync\n');
+    },
+  });
+  expect(calls).toBe(2); // busy once, then committed and integrated again
+  expect(r).toMatchObject({ pushed: true, resolved: ['x.txt'] });
+  expect(remoteFile('x.txt')).toBe('app, written mid-sync\n');
+  clean(appDir);
+}, T);

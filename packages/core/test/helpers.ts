@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { expect } from 'vitest';
+import { afterEach, expect } from 'vitest';
 import { DataRepo } from '../src/repo.ts';
 import { newId } from '../src/ids.ts';
 import type {
@@ -31,8 +31,16 @@ import type { Writer } from '../src/layout.ts';
 export const T0 = '2026-11-11T09:00:00.000Z';
 export const T1 = '2026-11-11T10:00:00.000Z';
 
+/** Temp dirs made by `tmpDir` during the current test; each is removed after the test, pass or fail. */
+const createdDirs: string[] = [];
+afterEach(() => {
+  for (const d of createdDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
+
 export function tmpDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'cob-test-'));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'cob-test-'));
+  createdDirs.push(d);
+  return d;
 }
 
 export function tmpRepo(writer: Writer, dir?: string): DataRepo {
