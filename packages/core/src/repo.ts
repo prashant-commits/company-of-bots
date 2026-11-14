@@ -4,6 +4,7 @@ import { assertSafeId } from './ids.ts';
 import { KINDS, SINGLETONS, type KindName, type KindType, type SingletonName, type SingletonType, type Writer } from './layout.ts';
 import {
   assertEntryIsPlainFile,
+  assertRegularFile,
   atomicWrite,
   isTmpArtifactName,
   nodeGuardFs,
@@ -72,8 +73,11 @@ function parseJsonUtf8(raw: string): unknown {
 }
 
 function readCobJsonMeta(dir: string): void {
-  const metaPath = path.join(dir, 'cob.json');
-  if (!fs.existsSync(metaPath)) return;
+  // Same rule as getSingleton('meta'): a link, or anything that is not a regular file, is refused before any read.
+  const metaPath = resolveRepoPath(path, nodeGuardFs, dir, SINGLETONS.meta.path);
+  const st = lstatOrNull(metaPath);
+  if (st === null) return;
+  assertRegularFile(st, SINGLETONS.meta.path);
 
   let raw: string;
   try {
@@ -126,8 +130,11 @@ export class DataRepo {
 
   get<K extends KindName>(kind: K, id: string): KindType<K> | null {
     assertSafeId(id);
-    const file = this.resolve(recordRelPath(KINDS[kind].dir, id));
-    if (lstatOrNull(file) === null) return null;
+    const rel = recordRelPath(KINDS[kind].dir, id);
+    const file = this.resolve(rel);
+    const st = lstatOrNull(file);
+    if (st === null) return null;
+    assertRegularFile(st, rel);
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -176,7 +183,7 @@ export class DataRepo {
       if (!name.endsWith('.json') || isTmpArtifactName(name)) continue;
       const file = path.join(kindDir, name);
       try {
-        assertEntryIsPlainFile(nodeGuardFs, file, `${entry.dir}/${name}`);
+        assertEntryIsPlainFile(path, nodeGuardFs, file, `${entry.dir}/${name}`);
       } catch (e) {
         errors.push({ file, error: e instanceof Error ? e.message : String(e) });
         continue;
@@ -198,6 +205,13 @@ export class DataRepo {
       const result = entry.schema.safeParse(parsed);
       if (!result.success) {
         errors.push({ file, error: result.error.message });
+        continue;
+      }
+      const key = recordFileId(kind, result.data as KindType<KindName>);
+      try {
+        assertSafeId(key);
+      } catch (e) {
+        errors.push({ file, error: e instanceof Error ? e.message : String(e) });
         continue;
       }
       if (!recordStemMatches(kind, file, result.data as KindType<KindName>)) {
@@ -260,7 +274,9 @@ export class DataRepo {
   getSingleton<S extends SingletonName>(name: S): SingletonType<S> | null {
     const entry = SINGLETONS[name];
     const file = this.resolve(entry.path);
-    if (lstatOrNull(file) === null) return null;
+    const st = lstatOrNull(file);
+    if (st === null) return null;
+    assertRegularFile(st, entry.path);
     let raw: string;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -305,6 +321,7 @@ export class DataRepo {
     const abs = this.resolve(relPath, { allowExistingDirectory: true, allowRepoRoot: relPath === '' });
     const st = lstatOrNull(abs);
     if (st === null || st.isDirectory()) return null;
+    assertRegularFile(st, relPath);
     return fs.readFileSync(abs);
   }
 

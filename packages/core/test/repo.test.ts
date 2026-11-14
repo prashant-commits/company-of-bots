@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, test, vi } from 'vitest';
 import { DataRepo, OwnershipError, UnsupportedSchemaError } from '../src/repo.ts';
 import { UnsafeNameError } from '../src/ids.ts';
@@ -13,6 +15,7 @@ import {
   type GuardFs,
   type PathApi,
 } from '../src/repo-paths.ts';
+import { queuedCommands } from '../src/commands.ts';
 import { pair, sample, T0, tmpDir, tmpRepo } from './helpers.ts';
 
 test('put then get round-trips and writes pretty JSON with a trailing newline', () => {
@@ -225,7 +228,7 @@ function fakeFs(api: PathApi) {
     lstat(p) {
       const n = nodes.get(key(p));
       if (!n) return null;
-      return { isSymbolicLink: () => n.t === 'link', isDirectory: () => n.t === 'dir' };
+      return { isSymbolicLink: () => n.t === 'link', isDirectory: () => n.t === 'dir', isFile: () => n.t === 'file' };
     },
     realpath(p) {
       const full = key(p);
@@ -280,7 +283,7 @@ for (const { name, api, repo, outside } of RULES) {
 
         f.file(expected);
         expect(resolveRepoPath(api, f.probe, repo, rel), `${kind}, record exists`).toBe(expected);
-        expect(() => assertEntryIsPlainFile(f.probe, expected, rel), kind).not.toThrow();
+        expect(() => assertEntryIsPlainFile(api, f.probe, expected, rel), kind).not.toThrow();
 
         const listed = fakeFs(api);
         listed.dir(native(...entry.dir.split('/')));
@@ -369,6 +372,41 @@ for (const { name, api, repo, outside } of RULES) {
     });
   });
 
+  describe(`Q2 ${tag} names that Windows would normalise`, () => {
+    const refusedNames = [
+      '.. /x.pdf', 'profile/.. /x.pdf', 'profile/resumes/.. ', 'name. ', 'profile/resumes/cv.pdf.', 'profile/resumes/cv.pdf ', 'profile/resumes/a. .',
+      'profile/.../x.pdf', 'profile/resumes/. ', 'profile/./resumes/cv.pdf', 'profile/../roles/x.json', 'profile//resumes/cv.pdf', 'profile/resumes/',
+      'profile/resumes/CON', 'profile/resumes/con', 'profile/resumes/Con.txt', 'profile/resumes/PRN', 'profile/resumes/aux.tar.gz', 'profile/resumes/NUL',
+      'profile/resumes/nul.', 'profile/resumes/COM1', 'profile/resumes/com9.pdf', 'profile/resumes/LPT1', 'profile/resumes/lpt9.x', 'profile/resumes/COM\u00b9',
+      'GIT~1/config', 'git~1/config', 'Git~12/x', 'profile/GIT~1', 'GIT~1./x',
+    ];
+    test(`Q2 ${tag} trailing dots or spaces, empty, '.' and '..' segments, device names and GIT~n are refused`, () => {
+      const f = fakeFs(api);
+      f.dir(repo);
+      for (const rel of refusedNames) {
+        expect(() => resolveRepoPath(api, f.probe, repo, rel, { allowExistingDirectory: true }), rel).toThrow(UnsafeNameError);
+        expect(() => resolveRepoPath(api, fakeFs(api).probe, repo, rel, { allowExistingDirectory: true }), `${rel} (no repo dir)`).toThrow(UnsafeNameError);
+      }
+    });
+
+    test(`Q2 ${tag} names that look close but are fine pass`, () => {
+      const f = fakeFs(api);
+      f.dir(repo);
+      for (const rel of ['profile/resumes/COM0', 'profile/resumes/COM10', 'profile/resumes/console.pdf', 'profile/resumes/connect', 'profile/resumes/git~', 'profile/resumes/git~a', 'profile/resumes/.hidden', 'profile/resumes/a.b.c', 'profile/resumes/..a', 'profile/resumes/a..b', 'profile/resumes/LPT0', 'profile/resumes/prn-1.pdf']) {
+        expect(() => resolveRepoPath(api, f.probe, repo, rel), rel).not.toThrow();
+      }
+    });
+
+    test(`Q3 ${tag} a regular file where a directory belongs is UnsafeNameError`, () => {
+      const f = fakeFs(api);
+      f.file(native('profile'));
+      for (const rel of ['profile/points/x.json', 'profile/master.json', 'profile/resumes/cv.pdf']) {
+        expect(() => resolveRepoPath(api, f.probe, repo, rel), rel).toThrow(UnsafeNameError);
+      }
+      expect(() => resolveRepoPath(api, f.probe, repo, 'profile/points', { allowExistingDirectory: true })).toThrow(UnsafeNameError);
+    });
+  });
+
   describe(`P3 ${tag} symbolic links`, () => {
     const cases: { label: string; build: (f: ReturnType<typeof fakeFs>) => void; rel: string; opts?: { allowExistingDirectory?: boolean } }[] = [
       { label: 'record file link', build: (f) => { f.file(`${outside}/real.json`); f.dir(native('profile/points')); f.link(native('profile/points/real.json'), `${outside}/real.json`); }, rel: 'profile/points/real.json' },
@@ -407,9 +445,9 @@ for (const { name, api, repo, outside } of RULES) {
       f.link(native('profile/points/l1.json'), `${outside}/x.json`);
       f.link(native('profile/points/l2.json'), native('profile/points/ok.json'));
       f.dir(native('profile/points/d.json'));
-      expect(() => assertEntryIsPlainFile(f.probe, native('profile/points/ok.json'), 'profile/points/ok.json')).not.toThrow();
+      expect(() => assertEntryIsPlainFile(api, f.probe, native('profile/points/ok.json'), 'profile/points/ok.json')).not.toThrow();
       for (const n of ['l1.json', 'l2.json', 'd.json']) {
-        expect(() => assertEntryIsPlainFile(f.probe, native('profile/points', n), `profile/points/${n}`), n).toThrow(UnsafeNameError);
+        expect(() => assertEntryIsPlainFile(api, f.probe, native('profile/points', n), `profile/points/${n}`), n).toThrow(UnsafeNameError);
       }
     });
   });
@@ -598,15 +636,6 @@ test('P3 a repo dir that is itself reached through a link still works', (ctx) =>
   app.deleteBlob('profile/resumes/cv.pdf');
 });
 
-test('P3 a path whose parent is a regular file does not leak a raw error from get, delete or getSingleton', () => {
-  const { repo, app } = bases();
-  fs.writeFileSync(path.join(repo, 'profile'), 'a file where a directory belongs');
-  expect(app.get('point', 'x')).toBeNull();
-  expect(() => app.delete('point', 'x')).not.toThrow();
-  expect(app.getSingleton('master')).toBeNull();
-  expect(app.list('point')).toEqual({ items: [], errors: [] });
-});
-
 // P4: a write that fails after its temp file exists
 test('P4 a failed rename removes the temp file and rethrows (a directory at the target name, which also fails for root)', () => {
   const dir = tmpDir();
@@ -661,4 +690,311 @@ test('P6 list over many records makes about one lstat per record', () => {
   } finally {
     spy.mockRestore();
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix 1 rows Q1-Q6
+// ---------------------------------------------------------------------------------------------
+
+const REPO_URL = pathToFileURL(path.join(import.meta.dirname, '../src/repo.ts')).href;
+
+/** Runs `body` in a child node process with a time limit, because a read of a FIFO cannot be interrupted in-process. */
+function inChild(body: string): { out: string; timedOut: boolean } {
+  const script = `import { DataRepo } from ${JSON.stringify(REPO_URL)};\nconst show = (f) => { try { const r = f(); return r === undefined ? 'ok' : JSON.stringify(r); } catch (e) { return e.name; } };\n${body}`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 8000, encoding: 'utf8' });
+  return { out: `${r.stdout}${r.stderr}`.trim(), timedOut: r.error !== undefined && (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' };
+}
+
+function mkfifo(at: string): boolean {
+  if (process.platform === 'win32') return false;
+  try {
+    execFileSync('mkfifo', [at]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test('Q1 a cob.json that is a link (to a file, to a directory, or dangling) makes new DataRepo throw UnsafeNameError before any read', (ctx) => {
+  const { repo, outside } = bases();
+  const v7 = path.join(outside, 'meta.json');
+  fs.writeFileSync(v7, JSON.stringify({ schemaVersion: 7, createdAt: T0 }));
+  fs.mkdirSync(path.join(outside, 'dir'));
+  const cases: [string, string, 'file' | 'dir'][] = [
+    ['file link to a version 7 file', v7, 'file'],
+    ['file link to a valid version 1 file', v7, 'file'],
+    ['directory link', path.join(outside, 'dir'), 'dir'],
+    ['dangling file link', path.join(outside, 'gone.json'), 'file'],
+    ['dangling directory link', path.join(outside, 'gone'), 'dir'],
+  ];
+  for (const [label, target, type] of cases) {
+    if (label.includes('valid version 1')) fs.writeFileSync(v7, JSON.stringify({ schemaVersion: 1, createdAt: T0 }));
+    const at = path.join(repo, 'cob.json');
+    fs.rmSync(at, { force: true });
+    if (!linkTo(target, at, type)) return ctx.skip();
+    expect(() => new DataRepo(repo, 'app'), label).toThrow(UnsafeNameError);
+  }
+});
+
+test('Q1 a cob.json that is a directory makes new DataRepo throw UnsafeNameError', () => {
+  const { repo } = bases();
+  fs.mkdirSync(path.join(repo, 'cob.json'));
+  expect(() => new DataRepo(repo, 'app')).toThrow(UnsafeNameError);
+});
+
+test('Q1 a cob.json that is a FIFO makes new DataRepo throw UnsafeNameError and never block', (ctx) => {
+  const { repo } = bases();
+  if (!mkfifo(path.join(repo, 'cob.json'))) return ctx.skip();
+  const r = inChild(`console.log(show(() => new DataRepo(${JSON.stringify(repo)}, 'app')));`);
+  expect(r.timedOut).toBe(false);
+  expect(r.out).toBe('UnsafeNameError');
+});
+
+test('Q1 a FIFO at a record, singleton or blob path is refused by every read and never blocks', (ctx) => {
+  const { repo } = bases();
+  for (const d of ['profile/points', 'profile', 'profile/resumes']) fs.mkdirSync(path.join(repo, d), { recursive: true });
+  if (!mkfifo(path.join(repo, 'profile/points/f.json'))) return ctx.skip();
+  mkfifo(path.join(repo, 'profile/master.json'));
+  mkfifo(path.join(repo, 'profile/resumes/cv.pdf'));
+  const r = inChild(`const app = new DataRepo(${JSON.stringify(repo)}, 'app');
+console.log(JSON.stringify([
+  show(() => app.get('point', 'f')),
+  show(() => app.getSingleton('master')),
+  show(() => app.readBlob('profile/resumes/cv.pdf')),
+  show(() => { const l = app.list('point'); return [l.items.length, l.errors.length]; }),
+]));`);
+  expect(r.timedOut).toBe(false);
+  expect(JSON.parse(r.out)).toEqual(['UnsafeNameError', 'UnsafeNameError', 'UnsafeNameError', '[0,1]']);
+});
+
+test('Q2 caller blob paths with a Windows-normalised segment are refused by all four blob methods, for both writers, on every OS', () => {
+  const { base, app } = bases();
+  const agent = new DataRepo(app.dir, 'agent');
+  const refused = ['profile/resumes/.. ', 'profile/resumes/cv.pdf.', 'profile/resumes/cv.pdf ', '.. /x.pdf', 'profile/.../x.pdf', 'profile/resumes/CON', 'profile/resumes/nul.txt', 'profile/resumes/Com3', 'profile/resumes/LPT9.pdf', 'GIT~1/config', 'git~2'];
+  for (const rel of refused) {
+    for (const repo of [app, agent]) {
+      expect(() => repo.writeBlob(rel, new Uint8Array([1])), `writeBlob ${rel}`).toThrow(UnsafeNameError);
+      expect(() => repo.readBlob(rel), `readBlob ${rel}`).toThrow(UnsafeNameError);
+      expect(() => repo.listBlobs(rel), `listBlobs ${rel}`).toThrow(UnsafeNameError);
+      expect(() => repo.deleteBlob(rel), `deleteBlob ${rel}`).toThrow(UnsafeNameError);
+    }
+  }
+  expect(fs.readdirSync(app.dir)).toEqual([]);
+  expect(fs.readdirSync(base).sort()).toEqual(['outside', 'repo']);
+});
+
+test('Q2 record ids that are device names are refused by get, put and delete, and a hand-made file with such a name is reported by list', () => {
+  const app = tmpRepo('app');
+  for (const id of ['con', 'NUL', 'aux', 'com1', 'lpt9']) {
+    expect(() => app.get('point', id), id).toThrow(UnsafeNameError);
+    expect(() => app.put('point', sample.point({ id })), id).toThrow(UnsafeNameError);
+    expect(() => app.delete('point', id), id).toThrow(UnsafeNameError);
+  }
+  fs.mkdirSync(path.join(app.dir, 'profile/points'), { recursive: true });
+  fs.writeFileSync(path.join(app.dir, 'profile/points/con.json'), `${JSON.stringify(sample.point({ id: 'con' }))}\n`);
+  app.put('point', sample.point({ id: 'fine' }));
+  const { items, errors } = app.list('point');
+  expect(items.map((p) => p.id)).toEqual(['fine']);
+  expect(errors.map((e) => path.basename(e.file))).toEqual(['con.json']);
+});
+
+test('Q3 a regular file where a directory belongs is UnsafeNameError from every method, with no raw ENOTDIR or EEXIST', () => {
+  const { repo, app } = bases();
+  fs.writeFileSync(path.join(repo, 'profile'), 'a file where a directory belongs');
+  expect(() => app.get('point', 'x')).toThrow(UnsafeNameError);
+  expect(() => app.put('point', sample.point({ id: 'x' }))).toThrow(UnsafeNameError);
+  expect(() => app.delete('point', 'x')).toThrow(UnsafeNameError);
+  expect(() => app.getSingleton('master')).toThrow(UnsafeNameError);
+  expect(() => app.putSingleton('master', { file: 'cv.pdf' })).toThrow(UnsafeNameError);
+  expect(() => app.writeBlob('profile/resumes/cv.pdf', new Uint8Array([1]))).toThrow(UnsafeNameError);
+  expect(() => app.readBlob('profile/resumes/cv.pdf')).toThrow(UnsafeNameError);
+  expect(() => app.listBlobs('profile/resumes')).toThrow(UnsafeNameError);
+  expect(() => app.deleteBlob('profile/resumes/cv.pdf')).toThrow(UnsafeNameError);
+  const { items, errors } = app.list('point');
+  expect(items).toEqual([]);
+  expect(errors).toHaveLength(1);
+  expect(fs.readFileSync(path.join(repo, 'profile'), 'utf8')).toBe('a file where a directory belongs');
+  expect(fs.readdirSync(repo)).toEqual(['profile']);
+});
+
+test('Q3 a regular file at a deeper level (the kind dir) is UnsafeNameError from put and writeBlob, and leaves no temp file', () => {
+  const { repo, app } = bases();
+  fs.mkdirSync(path.join(repo, 'profile'));
+  fs.writeFileSync(path.join(repo, 'profile/points'), 'file');
+  fs.writeFileSync(path.join(repo, 'profile/resumes'), 'file');
+  expect(() => app.put('point', sample.point({ id: 'x' }))).toThrow(UnsafeNameError);
+  expect(() => app.writeBlob('profile/resumes/cv.pdf', new Uint8Array([1]))).toThrow(UnsafeNameError);
+  expect(fs.readdirSync(path.join(repo, 'profile')).sort()).toEqual(['points', 'resumes']);
+});
+
+test('Q5 list reports a record whose key is not a safe id in errors and does not return it', () => {
+  const app = tmpRepo('app');
+  app.put('point', sample.point({ id: 'good' }));
+  const d = path.join(app.dir, 'profile/points');
+  const bad = ['my point', 'a\\b', '..', 'x:y', 'é', 'a/b'];
+  const names: string[] = [];
+  for (const id of bad) {
+    const name = `${id.replace(/\//g, '_')}.json`;
+    if (name.includes('/')) continue;
+    names.push(name);
+    fs.writeFileSync(path.join(d, name), `${JSON.stringify(sample.point({ id }))}\n`);
+  }
+  const { items, errors } = app.list('point');
+  expect(items.map((p) => p.id)).toEqual(['good']);
+  expect(errors.map((e) => path.basename(e.file)).sort()).toEqual([...names].sort());
+});
+
+test('Q5 a queued command with an unsafe id is reported and never reaches queuedCommands', () => {
+  const { app, agent } = pair();
+  const ok = sample.command({ id: '20261111T090000000Z-aaaaaa' });
+  app.put('command', ok);
+  const dir = path.join(app.dir, 'commands');
+  fs.writeFileSync(path.join(dir, 'bad id.json'), `${JSON.stringify(sample.command({ id: 'bad id', createdAt: '2020-01-01T00:00:00.000Z' }))}\n`);
+  expect(queuedCommands(agent).map((c) => c.id)).toEqual([ok.id]);
+  const { items, errors } = agent.list('command');
+  expect(items.map((c) => c.id)).toEqual([ok.id]);
+  expect(errors.map((e) => path.basename(e.file))).toEqual(['bad id.json']);
+});
+
+test('Q6 a nested blob name is refused, in both resume folders', () => {
+  const app = tmpRepo('app');
+  expect(() => app.writeBlob('profile/resumes/a/b.pdf', new Uint8Array([1]))).toThrow(OwnershipError);
+  expect(() => app.writeBlob('profile/resume-text/a/b.txt', new Uint8Array([1]))).toThrow(OwnershipError);
+  expect(() => app.deleteBlob('profile/resumes/a/b.pdf')).toThrow(OwnershipError);
+  expect(fs.existsSync(path.join(app.dir, 'profile/resumes'))).toBe(false);
+});
+
+test('Q6 the app can write, read, list and delete profile/resume-text/<name>; the agent cannot', () => {
+  const app = tmpRepo('app');
+  const agent = new DataRepo(app.dir, 'agent');
+  app.writeBlob('profile/resume-text/cv.pdf.txt', new TextEncoder().encode('text'));
+  expect(app.readBlob('profile/resume-text/cv.pdf.txt')?.toString()).toBe('text');
+  expect(agent.listBlobs('profile/resume-text')).toEqual(['cv.pdf.txt']);
+  expect(() => agent.writeBlob('profile/resume-text/other.txt', new Uint8Array([1]))).toThrow(OwnershipError);
+  expect(() => agent.deleteBlob('profile/resume-text/cv.pdf.txt')).toThrow(OwnershipError);
+  app.deleteBlob('profile/resume-text/cv.pdf.txt');
+  expect(app.listBlobs('profile/resume-text')).toEqual([]);
+});
+
+test('Q6 the id and file-name comparison is exact and case-sensitive', () => {
+  const app = tmpRepo('app');
+  const d = path.join(app.dir, 'profile/points');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'P1.json'), `${JSON.stringify(sample.point({ id: 'p1' }))}\n`);
+  const { items, errors } = app.list('point');
+  expect(items).toEqual([]);
+  expect(errors.map((e) => path.basename(e.file))).toEqual(['P1.json']);
+  expect(errors[0]!.error).toMatch(/does not match/);
+  expect(() => app.get('point', 'P1')).toThrow(/does not match/);
+});
+
+test('Q6 only names ending in .tmp- plus exactly six hex digits are hidden (5 and 7 digits are listed)', () => {
+  const app = tmpRepo('app');
+  const d = path.join(app.dir, 'profile/resumes');
+  fs.mkdirSync(d, { recursive: true });
+  for (const n of ['cv.pdf.tmp-abcde', 'cv.pdf.tmp-abcdef0', 'cv.pdf.tmp-abcdef', 'cv.pdf.tmp-ABCDEF', 'cv.pdf.tmp-abcdeg']) fs.writeFileSync(path.join(d, n), 'x');
+  expect(app.listBlobs('profile/resumes').sort()).toEqual(['cv.pdf.tmp-ABCDEF', 'cv.pdf.tmp-abcde', 'cv.pdf.tmp-abcdeg', 'cv.pdf.tmp-abcdef0'].sort());
+});
+
+// Q4: DataRepo itself, with node:path replaced by path.win32 and node:fs by a wrapper that maps C:\data\repo onto a temp dir.
+describe('Q4 [path.win32] DataRepo itself under Windows path rules', () => {
+  async function loadUnderWin32() {
+    const real = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const tmp = real.realpathSync(tmpDir());
+    const WROOT = 'C:\\data\\repo';
+    const toReal = (p: unknown): unknown =>
+      typeof p === 'string' && p.toLowerCase().startsWith(WROOT.toLowerCase()) ? path.join(tmp, ...p.slice(WROOT.length).split('\\').filter(Boolean)) : p;
+    const toWin = (p: string): string => (p === tmp ? WROOT : p.startsWith(`${tmp}/`) ? WROOT + p.slice(tmp.length).replace(/\//g, '\\') : p);
+    const one = (name: string) => (p: unknown, ...rest: unknown[]) => (real as any)[name](toReal(p), ...rest);
+    const fsShim = {
+      lstatSync: one('lstatSync'),
+      statSync: one('statSync'),
+      existsSync: one('existsSync'),
+      readFileSync: one('readFileSync'),
+      writeFileSync: one('writeFileSync'),
+      mkdirSync: one('mkdirSync'),
+      readdirSync: one('readdirSync'),
+      unlinkSync: one('unlinkSync'),
+      rmSync: one('rmSync'),
+      renameSync: (a: unknown, b: unknown) => real.renameSync(toReal(a) as string, toReal(b) as string),
+      realpathSync: Object.assign((p: unknown, ...r: unknown[]) => toWin((real as any).realpathSync(toReal(p), ...r)), {
+        native: (p: unknown, ...r: unknown[]) => toWin((real as any).realpathSync.native(toReal(p), ...r)),
+      }),
+    };
+    vi.resetModules();
+    vi.doMock('node:path', () => ({ default: path.win32, ...path.win32 }));
+    vi.doMock('node:fs', () => ({ default: fsShim, ...fsShim }));
+    const repoMod = await import('../src/repo.ts');
+    const commandsMod = await import('../src/commands.ts');
+    return { tmp, WROOT, repoMod, commandsMod };
+  }
+  const unload = () => {
+    vi.doUnmock('node:path');
+    vi.doUnmock('node:fs');
+    vi.resetModules();
+  };
+
+  test('Q4 [path.win32] get, put, list, delete, putSingleton, createCommand and the blob methods work, and files land where expected', async () => {
+    const { tmp, WROOT, repoMod, commandsMod } = await loadUnderWin32();
+    try {
+      const { DataRepo: Repo } = repoMod;
+      const app = new Repo(WROOT, 'app');
+      const agent = new Repo(WROOT, 'agent');
+
+      app.put('point', sample.point({ id: 'p1' }));
+      expect(fs.existsSync(path.join(tmp, 'profile/points/p1.json'))).toBe(true);
+      expect(app.get('point', 'p1')).toEqual(sample.point({ id: 'p1' }));
+      expect(app.list('point').items.map((p) => p.id)).toEqual(['p1']);
+      expect(app.get('point', 'missing')).toBeNull();
+
+      // Proof that repo.ts really ran with Windows rules: its own paths in error entries use backslashes.
+      fs.writeFileSync(path.join(tmp, 'profile/points/bad.json'), '{not json');
+      expect(app.list('point').errors.map((e) => e.file)).toEqual([`${WROOT}\\profile\\points\\bad.json`]);
+
+      agent.put('role', sample.role({ id: 'r1' }));
+      expect(fs.existsSync(path.join(tmp, 'roles/r1.json'))).toBe(true);
+      expect(agent.list('role').items).toHaveLength(1);
+
+      app.putSingleton('lanes', { lanes: [{ id: 'l', name: 'L' }] });
+      expect(app.getSingleton('lanes')).toEqual({ lanes: [{ id: 'l', name: 'L' }] });
+      expect(fs.existsSync(path.join(tmp, 'guide/lanes.json'))).toBe(true);
+
+      const cmd = commandsMod.createCommand(app, { verb: 'run_role', target: null, payload: { role: 'finder' } });
+      expect(fs.existsSync(path.join(tmp, 'commands', `${cmd.id}.json`))).toBe(true);
+      expect(commandsMod.queuedCommands(agent).map((c) => c.id)).toEqual([cmd.id]);
+      commandsMod.finishCommand(agent, cmd.id, 'done', 'ok');
+      expect(commandsMod.queuedCommands(agent)).toEqual([]);
+
+      app.writeBlob('profile/resumes/cv.pdf', new Uint8Array([1, 2]));
+      expect(app.readBlob('profile/resumes/cv.pdf')?.length).toBe(2);
+      expect(app.listBlobs('profile/resumes')).toEqual(['cv.pdf']);
+      // A caller that builds its blob path with path.join gets backslashes, and is refused (contract: `/`).
+      expect(() => app.writeBlob(path.win32.join('profile', 'resumes', 'x.pdf'), new Uint8Array([1]))).toThrow(/unsafe repo path/);
+      app.deleteBlob('profile/resumes/cv.pdf');
+
+      app.delete('point', 'p1');
+      expect(fs.existsSync(path.join(tmp, 'profile/points/p1.json'))).toBe(false);
+      expect(fs.readdirSync(path.join(tmp, 'profile/points')).filter((n) => /\.tmp-/.test(n))).toEqual([]);
+    } finally {
+      unload();
+    }
+  });
+
+  test('Q4 [path.win32] links and escapes are still refused, and the repo dir may be at a drive root of the shim', async () => {
+    const { tmp, WROOT, repoMod } = await loadUnderWin32();
+    try {
+      const app = new repoMod.DataRepo(WROOT, 'app');
+      const outside = tmpDir();
+      fs.mkdirSync(path.join(tmp, 'profile'), { recursive: true });
+      if (linkTo(outside, path.join(tmp, 'profile/points'), 'dir')) {
+        expect(() => app.put('point', sample.point({ id: 'x' }))).toThrow(/symbolic link/);
+        expect(app.list('point').errors).toHaveLength(1);
+        expect(fs.readdirSync(outside)).toEqual([]);
+      }
+      expect(() => app.readBlob('..\\x')).toThrow(/unsafe repo path/);
+      expect(() => app.readBlob('C:/x')).toThrow(/escapes repo/);
+    } finally {
+      unload();
+    }
+  });
 });

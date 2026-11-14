@@ -16,7 +16,7 @@ export type PathApi = nodePath.PlatformPath;
 
 /** The few file-system questions the path guard asks. `null` means "there is nothing at that path". */
 export type GuardFs = {
-  lstat(p: string): { isSymbolicLink(): boolean; isDirectory(): boolean } | null;
+  lstat(p: string): { isSymbolicLink(): boolean; isDirectory(): boolean; isFile(): boolean } | null;
   realpath(p: string): string | null;
 };
 
@@ -78,6 +78,26 @@ export function assertRepoRelPath(api: PathApi, relPath: string, options: PathOp
   // Under Windows rules a colon inside a name opens an alternate data stream.
   if (api.sep === '\\' && relPath.includes(':')) throw unsafe(relPath);
   if (hasGitSegment(relPath)) throw unsafe(relPath);
+  for (const seg of relPath.split('/')) {
+    if (!isPortableSegment(seg)) throw unsafe(relPath);
+  }
+}
+
+// Win32 device names, with or without an extension: `CON`, `con.txt`, `COM1`, `LPT9.log`.
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(\..*)?$/i;
+
+/**
+ * Whether a checkout may hold this name on every OS. Win32 strips trailing dots and spaces from each
+ * segment before it uses it, so such a segment names something else there (`.. ` is `..`, `.git.` is `.git`).
+ * Device names and the short alias of `.git` (`GIT~1`) are refused for the same reason.
+ * The segment is rejected when, after that normalisation, it is empty, `.` or `..`, or when the
+ * normalisation changed it, or when it is a device name or a `.git` alias. Empty, `.` and `..` as written
+ * are not portable names either.
+ */
+function isPortableSegment(seg: string): boolean {
+  const normalized = seg.replace(/[. ]+$/, '');
+  if (seg === '' || seg === '.' || seg === '..' || normalized === '' || normalized !== seg) return false;
+  return !WINDOWS_DEVICE.test(normalized) && !/^git~[0-9]+$/i.test(normalized);
 }
 
 function escapes(api: PathApi, from: string, to: string): boolean {
@@ -117,6 +137,7 @@ export function resolveRepoPath(
     const st = probe.lstat(current);
     if (st === null) break; // nothing below this point exists, so nothing below it can be a link
     if (st.isSymbolicLink()) throw new UnsafeNameError(`symbolic link in repo path: ${parts.slice(0, i + 1).join('/')}`);
+    if (i < parts.length - 1 && !st.isDirectory()) throw new UnsafeNameError(`not a directory: ${parts.slice(0, i + 1).join('/')}`);
     anchor = current;
     if (i === parts.length - 1 && st.isDirectory() && !options.allowExistingDirectory) {
       throw new UnsafeNameError(`path is a directory: ${JSON.stringify(relPath)}`);
@@ -129,11 +150,18 @@ export function resolveRepoPath(
 }
 
 /** Check one directory entry found by `readdir` in an already checked directory. */
-export function assertEntryIsPlainFile(probe: GuardFs, absFile: string, relPath: string): void {
+export function assertEntryIsPlainFile(api: PathApi, probe: GuardFs, absFile: string, relPath: string): void {
+  assertRepoRelPath(api, relPath); // a name no checkout may hold on every OS is not a record either
   const st = probe.lstat(absFile);
   if (st === null) return;
   if (st.isSymbolicLink()) throw new UnsafeNameError(`symbolic link in repo path: ${relPath}`);
   if (st.isDirectory()) throw new UnsafeNameError(`path is a directory: ${JSON.stringify(relPath)}`);
+  if (!st.isFile()) throw new UnsafeNameError(`not a regular file: ${relPath}`);
+}
+
+/** A file this module is about to read must be a regular file: a FIFO or device would block or never end. */
+export function assertRegularFile(st: { isFile(): boolean }, relPath: string): void {
+  if (!st.isFile()) throw new UnsafeNameError(`not a regular file: ${relPath}`);
 }
 
 /** The repo-relative path of a record, built by the store from its kind dir and id (both `/` strings). */
