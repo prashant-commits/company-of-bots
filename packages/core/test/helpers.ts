@@ -17,15 +17,13 @@ import type {
   Master,
   OpenRole,
   Park,
-  ParkType,
   Point,
   Source,
   Transcript,
 } from '../src/schema.ts';
 import { CONFIRMED } from '../src/confidence.ts';
-import { beginSubmit, type ApplicationInput } from '../src/applications.ts';
+import { beginSubmit, type ApplicationInput, type ParkInput, type RoleInput } from '../src/applications.ts';
 import { processQueue } from '../src/process.ts';
-import type { KindName } from '../src/layout.ts';
 import type { Writer } from '../src/layout.ts';
 
 export const T0 = '2026-11-11T09:00:00.000Z';
@@ -52,7 +50,7 @@ export function said(quote: string): Evidence {
   return { type: 'said', quote };
 }
 
-export function roleInput(o: Partial<Omit<OpenRole, 'id' | 'foundAt'>> = {}): Omit<OpenRole, 'id' | 'foundAt'> {
+export function roleInput(o: Partial<RoleInput> = {}): RoleInput {
   return {
     title: 'Warehouse supervisor',
     organization: 'Example Foods',
@@ -192,7 +190,7 @@ export function pair(): {
   dir: string;
   app: DataRepo;
   agent: DataRepo;
-  seedPark: (id: string, park: Omit<Park, 'at'> | Park, extra?: Partial<Application>) => Application;
+  seedPark: (id: string, park: ParkInput | Park, extra?: Partial<Application>) => Application;
   seedInterruptedSubmit: (pointId?: string) => Application;
 } {
   const dir = tmpDir();
@@ -201,25 +199,15 @@ export function pair(): {
 
   const seedPark = (
     id: string,
-    park: Omit<Park, 'at'> | Park,
+    park: ParkInput | Park,
     extra: Partial<Application> = {},
   ): Application => {
-    const parkObj = park as {
-      type: ParkType;
-      at?: string;
-      site?: string;
-      fields?: string[];
-      contact?: string;
-      note?: string;
-      afterSubmit?: boolean;
-    };
-    const at = typeof parkObj.at === 'string' ? parkObj.at : T0;
-    const fullPark: Park = { ...parkObj, at };
+    const fullPark: Park = { ...park, at: 'at' in park && typeof park.at === 'string' ? park.at : T0 };
     const appRecord: Application = sample.application({
       id,
       state: 'parked',
       park: fullPark,
-      parkHistory: [{ type: fullPark.type, at }],
+      parkHistory: [{ type: fullPark.type, at: fullPark.at }],
       pendingSubmission: fullPark.afterSubmit
         ? {
             resumeFile: 'cv.pdf',
@@ -261,8 +249,7 @@ export function rebaseInProgress(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.git', 'rebase-merge')) || fs.existsSync(path.join(dir, '.git', 'rebase-apply'));
 }
 
-/** Assert the working tree has nothing uncommitted and no rebase is in progress. */
+/** Assert the working tree has nothing uncommitted. (Sync never starts a rebase; R13 tests check the user's own.) */
 export function clean(dir: string): void {
-  expect(rebaseInProgress(dir)).toBe(false);
   expect(execFileSync('git', ['status', '--porcelain'], { cwd: dir }).toString()).toBe('');
 }

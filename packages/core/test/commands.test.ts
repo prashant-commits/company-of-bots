@@ -2,13 +2,12 @@ import { beforeEach, expect, test } from 'vitest';
 import { createCommand, finishCommand, queuedCommands, CommandError } from '../src/commands.ts';
 import { pair, sample, seedLanes, tmpRepo } from './helpers.ts';
 
-let dir: string;
 let app: ReturnType<typeof tmpRepo>;
 let agent: ReturnType<typeof tmpRepo>;
 const appId = 'a1';
 
 beforeEach(() => {
-  ({ dir, app, agent } = pair());
+  ({ app, agent } = pair());
   agent.put('application', sample.application({ id: appId }));
   seedLanes(app);
 });

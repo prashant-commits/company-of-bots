@@ -1,9 +1,20 @@
+import path from 'node:path';
+import { z } from 'zod';
 import type { DataRepo } from './repo.ts';
 import { OwnershipError } from './repo.ts';
-import { isSendable, CONFIRMED, UNSURE } from './confidence.ts';
-export { CONFIRMED, UNSURE };
+import { isSendable } from './confidence.ts';
 import { newId, roleIdFor } from './ids.ts';
-import type { Application, OpenRole, Park, ParkType, Point, PointRef } from './schema.ts';
+import { httpUrlProblem, isSafeId } from './names.ts';
+import {
+  ApplyPathSchema,
+  ParkTypeSchema,
+  type Application,
+  type ApplyPath,
+  type OpenRole,
+  type ParkType,
+  type Point,
+  type PointRef,
+} from './schema.ts';
 
 export class UnsendablePointError extends Error {
   constructor(message: string) {
@@ -27,25 +38,130 @@ export type ApplicationInput = {
   sourceId?: string;
 };
 
+/** What the agent says about a park. Core adds `at`. Any other key is refused (a misspelt `afterSubmit` included). */
+export type ParkInput = {
+  type: ParkType;
+  site?: string;
+  fields?: string[];
+  contact?: string;
+  note?: string;
+  /** Only on an `error` park: the page failed after the submit click, so the application may have been sent. */
+  afterSubmit?: boolean;
+};
+
+/** An open role as the agent found it. Core adds `id` (from the link) and `foundAt`. Any other key is refused. */
+export type RoleInput = {
+  title: string;
+  organization: string;
+  location?: string;
+  sourceId: string;
+  link: string;
+  applyPath: ApplyPath;
+  contact?: string;
+};
+
 export type Outcome =
-  | { type: 'park'; park: Omit<Park, 'at'> }
+  | { type: 'park'; park: ParkInput }
   | { type: 'submitted'; resumeFile: string; points: PointRef[] }
   | { type: 'skipped'; hardNoPointId: string };
 
+/** A posting, as the agent knows it before it opens the page: its link, or the id `upsertRole` gave it. */
+export type PostingRef = { link: string } | { roleId: string };
+
+const ParkInputSchema = z.strictObject({
+  type: ParkTypeSchema,
+  site: z.string().optional(),
+  fields: z.array(z.string()).optional(),
+  contact: z.string().optional(),
+  note: z.string().optional(),
+  afterSubmit: z.boolean().optional(),
+}) satisfies z.ZodType<ParkInput>;
+
+const RoleInputSchema = z.strictObject({
+  title: z.string(),
+  organization: z.string(),
+  location: z.string().optional(),
+  sourceId: z.string(),
+  link: z.string(),
+  applyPath: ApplyPathSchema,
+  contact: z.string().optional(),
+}) satisfies z.ZodType<RoleInput>;
+
+/** Check an input from an untyped caller (a model's tool call): unknown keys and wrong values are named. */
+function checkInput<T>(schema: z.ZodType<T>, value: unknown, what: string): T {
+  const r = schema.safeParse(value);
+  if (r.success) return r.data;
+  const problems = r.error.issues.map((i) =>
+    i.code === 'unrecognized_keys'
+      ? `unknown ${what} key${i.keys.length > 1 ? 's' : ''} ${i.keys.map((k) => JSON.stringify(k)).join(', ')}`
+      : `${what}${i.path.length ? `.${i.path.join('.')}` : ''}: ${i.message}`,
+  );
+  throw new Error(`invalid ${what}: ${problems.join('; ')}`);
+}
+
 function assertHttpUrl(link: string): void {
-  let u: URL;
+  const problem = httpUrlProblem(link);
+  if (problem) throw new Error(`link ${problem}: ${link}`);
+}
+
+function roleIdOrNull(link: string): string | null {
   try {
-    u = new URL(link);
+    return roleIdFor(link);
   } catch {
-    throw new Error(`link is not a valid URL: ${link}`);
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new Error(`link must be http or https: ${link}`);
+    return null;
   }
 }
 
-function isValidPointId(id: unknown): boolean {
-  return typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..';
+/**
+ * The application for a posting, or null. A posting is matched by role id: the `roleId` an application was
+ * recorded with, or the id `roleIdFor` gives its link (so tracking parameters, the fragment, a trailing slash
+ * and host case do not matter). When an application file cannot be read, a match cannot be ruled out, so
+ * this throws `ApplicationStateError` naming the file rather than answer null.
+ */
+function findForPosting(repo: DataRepo, keys: Set<string>): Application | null {
+  const { items, errors } = repo.list('application');
+  let found: Application | null = null;
+  for (const app of items) {
+    const linkId = roleIdOrNull(app.link);
+    if ((app.roleId !== undefined && keys.has(app.roleId)) || (linkId !== null && keys.has(linkId))) found = app; // newest id wins
+  }
+  if (found === null && errors.length > 0) {
+    const files = errors.map((e) => path.relative(repo.dir, e.file).split(path.sep).join('/'));
+    throw new ApplicationStateError(
+      `cannot tell whether this posting already has an application: ${files.join(', ')} could not be read`,
+    );
+  }
+  return found;
+}
+
+function postingKeys(ref: { link?: string; roleId?: string }): Set<string> {
+  const keys = new Set<string>();
+  if (ref.roleId !== undefined) keys.add(ref.roleId);
+  if (ref.link !== undefined) {
+    assertHttpUrl(ref.link);
+    keys.add(roleIdFor(ref.link));
+  }
+  return keys;
+}
+
+/**
+ * The application that already exists for a posting, in any state, or null when there is none. The agent
+ * checks this before it opens a role: a posting with an application is never started again from the posting;
+ * another attempt goes through that application (`{ applicationId }`, after the user's Retry).
+ */
+export function applicationForPosting(repo: DataRepo, posting: PostingRef): Application | null {
+  return findForPosting(repo, postingKeys(posting as { link?: string; roleId?: string }));
+}
+
+/** One application per posting (R52): refuse a new one when the posting has any. */
+function assertNoApplicationFor(repo: DataRepo, input: ApplicationInput): void {
+  const existing = findForPosting(repo, postingKeys(input));
+  if (existing) {
+    throw new ApplicationStateError(
+      `posting ${input.link} already has application ${existing.id} (state ${existing.state}); ` +
+        `nothing was written. Another attempt goes through { applicationId: '${existing.id}' }.`,
+    );
+  }
 }
 
 export function sendablePoints(repo: DataRepo): Point[] {
@@ -55,7 +171,7 @@ export function sendablePoints(repo: DataRepo): Point[] {
 export function assertSendable(repo: DataRepo, refs: readonly PointRef[]): void {
   const badRefs: string[] = [];
   for (const ref of refs) {
-    if (!isValidPointId(ref.pointId) || typeof ref.rev !== 'number' || !Number.isInteger(ref.rev) || ref.rev < 1) {
+    if (!isSafeId(ref.pointId) || typeof ref.rev !== 'number' || !Number.isInteger(ref.rev) || ref.rev < 1) {
       badRefs.push(String(ref.pointId));
       continue;
     }
@@ -69,36 +185,17 @@ export function assertSendable(repo: DataRepo, refs: readonly PointRef[]): void 
   }
 }
 
-export function upsertRole(
-  repo: DataRepo,
-  input: Omit<OpenRole, 'id' | 'foundAt'>,
-  now: Date = new Date(),
-): { role: OpenRole; isNew: boolean } {
+export function upsertRole(repo: DataRepo, input: RoleInput, now: Date = new Date()): { role: OpenRole; isNew: boolean } {
   if (repo.writer !== 'agent') {
     throw new OwnershipError('only the agent may write roles');
   }
-  const roleInput = input as { link: string; [k: string]: unknown };
-  assertHttpUrl(roleInput.link);
-  const id = roleIdFor(roleInput.link);
+  const fields = checkInput(RoleInputSchema, input, 'role');
+  assertHttpUrl(fields.link);
+  const id = roleIdFor(fields.link);
   const existing = repo.get('role', id);
-  if (existing !== null) {
-    const role: OpenRole = {
-      ...existing,
-      ...input,
-      id,
-      foundAt: existing.foundAt,
-    } as OpenRole;
-    repo.put('role', role);
-    return { role, isNew: false };
-  } else {
-    const role: OpenRole = {
-      ...input,
-      id,
-      foundAt: now.toISOString(),
-    } as OpenRole;
-    repo.put('role', role);
-    return { role, isNew: true };
-  }
+  const role: OpenRole = { ...(existing ?? {}), ...fields, id, foundAt: existing?.foundAt ?? now.toISOString() };
+  repo.put('role', role);
+  return { role, isNew: existing === null };
 }
 
 export function beginSubmit(
@@ -129,6 +226,7 @@ export function beginSubmit(
     }
   } else {
     assertHttpUrl(target.link);
+    assertNoApplicationFor(repo, target);
   }
 
   assertSendable(repo, intent.points);
@@ -206,14 +304,15 @@ export function recordOutcome(
     throw new Error(`unknown outcome type: ${(outcome as any).type}`);
   }
 
-  // Validate park afterSubmit (B24)
-  if (outcome.type === 'park' && outcome.park.afterSubmit && outcome.park.type !== 'error') {
-    throw new Error(`afterSubmit is only valid on error parks, got ${outcome.park.type}`);
+  // Validate the park: known keys only (F3), and afterSubmit only on error parks (B24)
+  const parkInput = outcome.type === 'park' ? checkInput(ParkInputSchema, outcome.park, 'park') : null;
+  if (parkInput?.afterSubmit && parkInput.type !== 'error') {
+    throw new Error(`afterSubmit is only valid on error parks, got ${parkInput.type}`);
   }
 
   // Validate skip hardNoPointId (B6 / L2)
   if (outcome.type === 'skipped') {
-    if (!isValidPointId(outcome.hardNoPointId)) {
+    if (!isSafeId(outcome.hardNoPointId)) {
       throw new UnsendablePointError(`invalid hardNoPointId: ${outcome.hardNoPointId}`);
     }
     const pt = repo.get('point', outcome.hardNoPointId);
@@ -239,10 +338,7 @@ export function recordOutcome(
         );
       }
       if (existing.park?.type === 'error' && existing.park.afterSubmit) {
-        const isAllowedErrorAfterSubmit =
-          outcome.type === 'park' &&
-          outcome.park.type === 'error' &&
-          outcome.park.afterSubmit === true;
+        const isAllowedErrorAfterSubmit = parkInput?.type === 'error' && parkInput.afterSubmit === true;
         if (!isAllowedErrorAfterSubmit) {
           throw new ApplicationStateError(
             `application ${target.applicationId} is in state ${existing.state} (may have been sent), cannot record ${outcome.type}`,
@@ -259,6 +355,7 @@ export function recordOutcome(
     base = { ...existing };
   } else {
     assertHttpUrl(target.link);
+    assertNoApplicationFor(repo, target);
     base = {
       id: newId(now),
       roleId: target.roleId,
@@ -290,15 +387,7 @@ export function recordOutcome(
     base.park = null;
     base.closedAt = null;
     base.updatedAt = atIso;
-  } else if (outcome.type === 'park') {
-    const parkInput = outcome.park as {
-      type: ParkType;
-      site?: string;
-      fields?: string[];
-      contact?: string;
-      note?: string;
-      afterSubmit?: boolean;
-    };
+  } else if (outcome.type === 'park' && parkInput) {
     const previousParkAt =
       base.parkHistory.length > 0
         ? base.parkHistory[base.parkHistory.length - 1]!.at

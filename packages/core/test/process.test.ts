@@ -1,13 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, test } from 'vitest';
-import {
-  HANDLED_VERBS,
-  processCommand,
-  processQueue,
-  type Work,
-} from '../src/process.ts';
-import { CONFIRMED, beginSubmit, recordOutcome } from '../src/applications.ts';
+import { processCommand, processQueue } from '../src/process.ts';
+import { beginSubmit, recordOutcome, type ParkInput } from '../src/applications.ts';
+import { CONFIRMED } from '../src/confidence.ts';
 import { CommandError, createCommand, queuedCommands } from '../src/commands.ts';
 import { DataRepo } from '../src/repo.ts';
 import type { Application, Park } from '../src/schema.ts';
@@ -16,7 +12,7 @@ import { T0, T1, appInput, pair, sample, seedLanes } from './helpers.ts';
 let dir: string;
 let app: DataRepo;
 let agent: DataRepo;
-let seedPark: (id: string, park: Omit<Park, 'at'> | Park, extra?: Partial<Application>) => Application;
+let seedPark: (id: string, park: ParkInput | Park, extra?: Partial<Application>) => Application;
 let seedInterruptedSubmit: (pointId?: string) => Application;
 
 beforeEach(() => {
@@ -259,7 +255,7 @@ describe('process', () => {
   test('B21 no Work returned if application dropped in the same batch', () => {
     const p = seedPark('p-retry-drop-batch', { type: 'captcha' });
     const c1 = createCommand(app, { verb: 'retry', target: p.id, payload: {} }, new Date(T0));
-    const c2 = createCommand(app, { verb: 'drop', target: p.id, payload: { reason: 'changed my mind' } }, new Date(T1));
+    createCommand(app, { verb: 'drop', target: p.id, payload: { reason: 'changed my mind' } }, new Date(T1));
     const work = processQueue(agent);
     expect(work).toEqual([]);
     expect(agent.get('application', p.id)!.state).toBe('dropped');
@@ -300,9 +296,9 @@ describe('process', () => {
     const bad = seedPark('p-bad', { type: 'captcha' });
     const good2 = seedPark('p-good2', { type: 'captcha' });
 
-    const c1 = createCommand(app, { verb: 'done', target: good1.id, payload: {} }, new Date(T0));
+    createCommand(app, { verb: 'done', target: good1.id, payload: {} }, new Date(T0));
     const c2 = createCommand(app, { verb: 'done', target: bad.id, payload: {} }, new Date(T0));
-    const c3 = createCommand(app, { verb: 'done', target: good2.id, payload: {} }, new Date(T1));
+    createCommand(app, { verb: 'done', target: good2.id, payload: {} }, new Date(T1));
 
     // Corrupt bad file
     const badFile = path.join(dir, 'applications', `${bad.id}.json`);
@@ -508,7 +504,7 @@ describe('process', () => {
     const parkAt = s.park!.at;
 
     // Retry with notSent: true is accepted
-    const c = createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt } }, new Date(T1));
+    createCommand(app, { verb: 'retry', target: s.id, payload: { notSent: true, parkAt } }, new Date(T1));
     processQueue(agent, new Date(T1));
     const appAfterRetry = agent.get('application', s.id)!;
     expect(appAfterRetry.pendingSubmission).toBeNull();
@@ -545,7 +541,7 @@ describe('process', () => {
     );
     expect(parked.park!.note).toBeUndefined();
 
-    const c = createCommand(
+    createCommand(
       app,
       { verb: 'retry', target: s.id, payload: { notSent: true, parkAt: parked.park!.at } },
       new Date('2026-11-11T10:30:00.000Z'),

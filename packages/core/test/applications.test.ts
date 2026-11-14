@@ -1,8 +1,6 @@
 import { beforeEach, describe, expect, test } from 'vitest';
 import {
   ApplicationStateError,
-  CONFIRMED,
-  UNSURE,
   UnsendablePointError,
   assertSendable,
   beginSubmit,
@@ -10,8 +8,10 @@ import {
   recoverInterrupted,
   sendablePoints,
   upsertRole,
+  type ParkInput,
 } from '../src/applications.ts';
 import { createCommand } from '../src/commands.ts';
+import { CONFIRMED, UNSURE } from '../src/confidence.ts';
 import { processQueue } from '../src/process.ts';
 import { OwnershipError } from '../src/repo.ts';
 import { DataRepo } from '../src/repo.ts';
@@ -20,7 +20,7 @@ import { T0, T1, appInput, pair, roleInput, sample } from './helpers.ts';
 
 let app: DataRepo;
 let agent: DataRepo;
-let seedPark: (id: string, park: Omit<Park, 'at'> | Park, extra?: Partial<Application>) => Application;
+let seedPark: (id: string, park: ParkInput | Park, extra?: Partial<Application>) => Application;
 let seedInterruptedSubmit: (pointId?: string) => Application;
 
 beforeEach(() => {
@@ -203,7 +203,7 @@ describe('applications', () => {
 
     const s2 = beginSubmit(
       agent,
-      appInput(),
+      appInput({ link: 'https://careers.example.com/jobs/2' }), // another posting (one application per posting, R52)
       { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] },
       new Date(T0),
     );
@@ -690,7 +690,8 @@ describe('applications', () => {
 
     // Also verify recoverInterrupted enforces B28 when candidate time is same as previous park
     const R = new Date(T1);
-    const sub = beginSubmit(agent, appInput(), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
+    // Another posting (one application per posting, R52)
+    const sub = beginSubmit(agent, appInput({ link: 'https://careers.example.com/jobs/2' }), { resumeFile: 'cv.pdf', points: [{ pointId: 'p1', rev: 1 }] }, new Date(T0));
     // Initial recovery at R
     const rec1 = recoverInterrupted(agent, R);
     expect(rec1[0]!.park!.at).toBe(T1);

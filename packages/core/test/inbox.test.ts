@@ -1,18 +1,18 @@
 import { beforeEach, describe, expect, test } from 'vitest';
-import { BUTTONS, inboxRows, type Button, type RowType } from '../src/inbox.ts';
+import { BUTTONS, inboxRows } from '../src/inbox.ts';
 import { createCommand } from '../src/commands.ts';
 import { processQueue } from '../src/process.ts';
 import { DataRepo } from '../src/repo.ts';
+import type { ParkInput } from '../src/applications.ts';
 import type { Application, Park } from '../src/schema.ts';
 import { pair, sample } from './helpers.ts';
 
 let app: DataRepo;
 let agent: DataRepo;
-let seedPark: (id: string, park: Omit<Park, 'at'> | Park, extra?: Partial<Application>) => Application;
-let seedInterruptedSubmit: (pointId?: string) => Application;
+let seedPark: (id: string, park: ParkInput | Park, extra?: Partial<Application>) => Application;
 
 beforeEach(() => {
-  ({ app, agent, seedPark, seedInterruptedSubmit } = pair());
+  ({ app, agent, seedPark } = pair());
 });
 
 describe('inbox', () => {
